@@ -333,15 +333,33 @@ typedef struct ItemContext
 //
 typedef enum OpType
 {
-  OpAdd   = 0,
-  OpDel   = 1,
-  OpWrite = 2
+  OpAdd       = 0,
+  OpDel       = 1,
+  OpWrite     = 2,
+  OpInventory = 3
 } OpType;
+
+//
+// InventoryReq - an inventory asked for: the broker's thread waits on it, the client's thread fills it in.
+// Whoever is last frees it - the asker may have stopped waiting (abandoned)
+//
+typedef struct InventoryReq
+{
+  char*           from;                               // a NodeId; NULL: the Objects folder
+  int             depth;
+  char*           json;                               // the answer (malloc)
+  int             r;                                  // BRIDGE_*
+  char            err[256];
+  bool            done;
+  bool            abandoned;
+  pthread_cond_t  cond;
+} InventoryReq;
 
 typedef struct Op
 {
   OpType      type;
   char*       endpoint;
+  InventoryReq* invP;                                 // OpInventory
   UA_Variant  value;                                  // OpWrite
   char*       json;                                   // OpWrite: what the broker sent - for the echo
   struct Op*  next;
@@ -457,7 +475,7 @@ static void opPush(OpType type, const char* endpoint, UA_Variant* valueP, char* 
     return;
 
   opP->type     = type;
-  opP->endpoint = strdup(endpoint);
+  opP->endpoint = (endpoint != NULL) ? strdup(endpoint) : NULL;
   opP->json     = json;
 
   if (valueP != NULL)
@@ -840,6 +858,8 @@ typedef struct Walk
   int          variables;
   int          variablesMax;
   int          nodes;
+  bool         inventory;                             // for a mapping tool: a Variable's dataType and writable, and no deeper than maxDepth
+  int          maxDepth;
 } Walk;
 
 #define WALK_NODES_MAX  10000                         // a model larger than this is cut there, and says so
@@ -1037,22 +1057,53 @@ static void walkNode(Walk* wP, const UA_NodeId* idP, UA_NodeClass nodeClass, con
   //
   if (nodeClass == UA_NODECLASS_VARIABLE)
   {
-    UA_ReadValueId rv;
-    UA_ReadValueId_init(&rv);
-    rv.nodeId      = *idP;
-    rv.attributeId = UA_ATTRIBUTEID_VALUE;
+    //
+    // Its value - and, for a mapping tool, its DataType and AccessLevel: one Read of the three
+    //
+    UA_ReadValueId rv[3];
+
+    for (int ix = 0; ix < 3; ix++)
+    {
+      UA_ReadValueId_init(&rv[ix]);
+      rv[ix].nodeId = *idP;
+    }
+
+    rv[0].attributeId = UA_ATTRIBUTEID_VALUE;
+    rv[1].attributeId = UA_ATTRIBUTEID_DATATYPE;
+    rv[2].attributeId = UA_ATTRIBUTEID_ACCESSLEVEL;
 
     UA_ReadRequest request;
     UA_ReadRequest_init(&request);
-    request.nodesToRead        = &rv;
-    request.nodesToReadSize    = 1;
+    request.nodesToRead        = rv;
+    request.nodesToReadSize    = (wP->inventory == true) ? 3 : 1;
     request.timestampsToReturn = UA_TIMESTAMPSTORETURN_SOURCE;
 
     UA_ReadResponse response = UA_Client_Service_read(client, request);
 
+    if ((wP->inventory == true) && (response.responseHeader.serviceResult == UA_STATUSCODE_GOOD) && (response.resultsSize == 3))
+    {
+      if ((response.results[1].hasValue == true) && (UA_Variant_hasScalarType(&response.results[1].value, &UA_TYPES[UA_TYPES_NODEID]) == true))
+      {
+        const char* typeName = browseName((const UA_NodeId*) response.results[1].value.data);
+
+        if (typeName != NULL)
+        {
+          bufStr(bP, ",\"dataType\":");
+          bufJsonString(bP, typeName, strlen(typeName));
+        }
+      }
+
+      if ((response.results[2].hasValue == true) && (UA_Variant_hasScalarType(&response.results[2].value, &UA_TYPES[UA_TYPES_BYTE]) == true))
+      {
+        UA_Byte access = *(const UA_Byte*) response.results[2].value.data;
+
+        bufStr(bP, ((access & UA_ACCESSLEVELMASK_WRITE) != 0) ? ",\"writable\":true" : ",\"writable\":false");
+      }
+    }
+
     bufStr(bP, ",\"value\":");
 
-    if ((response.responseHeader.serviceResult == UA_STATUSCODE_GOOD) && (response.resultsSize == 1) && (response.results[0].hasValue == true))
+    if ((response.responseHeader.serviceResult == UA_STATUSCODE_GOOD) && (response.resultsSize >= 1) && (response.results[0].hasValue == true))
     {
       variantJson(bP, &response.results[0].value);
 
@@ -1087,6 +1138,7 @@ static void walkNode(Walk* wP, const UA_NodeId* idP, UA_NodeClass nodeClass, con
     //
     bool firstChild = true;
     bool firstRef   = true;
+    bool cut        = false;                          // inventory: the depth asked for ends at this node
 
     for (size_t ix = 0; ix < refs.referencesSize; ix++)
     {
@@ -1096,6 +1148,17 @@ static void walkNode(Walk* wP, const UA_NodeId* idP, UA_NodeClass nodeClass, con
         continue;
 
       bool modelClass = (rP->nodeClass == UA_NODECLASS_OBJECT) || (rP->nodeClass == UA_NODECLASS_VARIABLE) || (rP->nodeClass == UA_NODECLASS_METHOD);
+
+      if ((isChildReference(&rP->referenceTypeId) == true) && (modelClass == true) && (wP->inventory == true) && (depth >= wP->maxDepth))
+      {
+        //
+        // The depth asked for ends here: what is below is only said to be there - a tool asks for it next
+        //
+        if (cut == false)
+          bufStr(bP, ",\"hasChildren\":true");
+        cut = true;
+        continue;
+      }
 
       if ((isChildReference(&rP->referenceTypeId) == true) && (modelClass == true))
       {
@@ -1303,6 +1366,196 @@ static void endpointSetup(Endpoint* eP)
 
 // -----------------------------------------------------------------------------
 //
+// notConnected - why an inventory cannot be answered: the reason the server cannot be reached, when a connect
+// failed; else that there is no connection. On a broker thread or the client's, with the mutex not held
+//
+static void notConnected(char* buf, int bufLen)
+{
+  pthread_mutex_lock(&mutex);
+
+  if (unreachableReason[0] != 0)
+    snprintf(buf, bufLen, "%s", unreachableReason);
+  else
+    snprintf(buf, bufLen, "not connected to the OPC UA server %s", serverUrl);
+
+  pthread_mutex_unlock(&mutex);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// inventoryRun - an inventory asked for, on the client's thread: the tree from 'from', 'depth' levels down
+//
+static void inventoryRun(InventoryReq* reqP)
+{
+  UA_NodeId from = UA_NODEID_NUMERIC(0, UA_NS0ID_OBJECTSFOLDER);
+
+  reqP->r = BRIDGE_ERR;
+
+  if ((reqP->from != NULL) && (UA_NodeId_parse(&from, UA_STRING(reqP->from)) != UA_STATUSCODE_GOOD))
+  {
+    snprintf(reqP->err, sizeof(reqP->err), "'%s' is not an OPC UA NodeId", reqP->from);
+    reqP->r = BRIDGE_NOT_FOUND;
+    return;
+  }
+
+  UA_NodeClass      nodeClass = UA_NODECLASS_UNSPECIFIED;
+  UA_QualifiedName  name;
+  UA_ExpandedNodeId typeDef;
+
+  UA_QualifiedName_init(&name);
+  UA_ExpandedNodeId_init(&typeDef);
+
+  UA_StatusCode sc = UA_Client_readNodeClassAttribute(client, from, &nodeClass);
+
+  if (sc == UA_STATUSCODE_GOOD)
+    sc = UA_Client_readBrowseNameAttribute(client, from, &name);
+
+  //
+  // Not found only when the server says the node is not there - any other failure (the connection lost
+  // during the read, a timeout) is the server not answering, and the node may well be there
+  //
+  if ((sc == UA_STATUSCODE_BADNODEIDUNKNOWN) || (sc == UA_STATUSCODE_BADNODEIDINVALID))
+  {
+    snprintf(reqP->err, sizeof(reqP->err), "the OPC UA server has no node '%s' (%s)", (reqP->from != NULL) ? reqP->from : "Objects", UA_StatusCode_name(sc));
+    reqP->r = BRIDGE_NOT_FOUND;
+    UA_NodeId_clear(&from);
+    return;
+  }
+
+  if (sc != UA_STATUSCODE_GOOD)
+  {
+    snprintf(reqP->err, sizeof(reqP->err), "the OPC UA server did not answer the read of '%s' (%s)", (reqP->from != NULL) ? reqP->from : "Objects", UA_StatusCode_name(sc));
+    UA_QualifiedName_clear(&name);
+    UA_NodeId_clear(&from);
+    return;
+  }
+
+  //
+  // Its type - the HasTypeDefinition reference
+  //
+  UA_BrowseResult refs;
+
+  if (browseAll(&from, &refs) == true)
+  {
+    for (size_t ix = 0; ix < refs.referencesSize; ix++)
+    {
+      const UA_ReferenceDescription* rP = &refs.references[ix];
+
+      if ((rP->referenceTypeId.namespaceIndex == 0) && (rP->referenceTypeId.identifierType == UA_NODEIDTYPE_NUMERIC) &&
+          (rP->referenceTypeId.identifier.numeric == UA_NS0ID_HASTYPEDEFINITION))
+      {
+        UA_ExpandedNodeId_copy(&rP->nodeId, &typeDef);
+        break;
+      }
+    }
+
+    UA_BrowseResult_clear(&refs);
+  }
+
+  Walk w;
+
+  memset(&w, 0, sizeof(w));
+  w.inventory = true;
+  w.maxDepth  = reqP->depth;
+
+  walkVisited(&w, &from);
+  walkNode(&w, &from, nodeClass, &name, &typeDef, 0);
+
+  if ((w.b.failed == false) && (w.b.s != NULL))
+  {
+    reqP->json = w.b.s;
+    w.b.s      = NULL;
+    reqP->r    = BRIDGE_OK;
+  }
+  else
+    snprintf(reqP->err, sizeof(reqP->err), "out of memory");
+
+  walkFree(&w);
+  UA_QualifiedName_clear(&name);
+  UA_ExpandedNodeId_clear(&typeDef);
+  UA_NodeId_clear(&from);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// inventoryDone - the request answered: the asker is woken - or, gone, the request freed
+//
+static void inventoryDone(InventoryReq* reqP)
+{
+  pthread_mutex_lock(&mutex);
+
+  bool abandoned = reqP->abandoned;
+
+  reqP->done = true;
+  pthread_cond_signal(&reqP->cond);
+
+  pthread_mutex_unlock(&mutex);
+
+  if (abandoned == true)
+  {
+    free(reqP->json);
+    free(reqP->from);
+    pthread_cond_destroy(&reqP->cond);
+    free(reqP);
+  }
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// inventoriesRefuse - the queued inventories answered "not connected", on the client's thread while it has no
+// connection: one asked for just before the connection was found lost would else wait out its timeout. The
+// other queued calls stay queued, for the connection that comes back
+//
+static void inventoriesRefuse(void)
+{
+  Op* refusedP = NULL;
+
+  pthread_mutex_lock(&mutex);
+
+  Op** opPP = &opsHead;
+  Op*  prevP = NULL;
+
+  while (*opPP != NULL)
+  {
+    Op* opP = *opPP;
+
+    if (opP->type == OpInventory)
+    {
+      *opPP      = opP->next;
+      opP->next  = refusedP;
+      refusedP   = opP;
+      if (opsTail == opP)
+        opsTail = prevP;
+      continue;
+    }
+
+    prevP = opP;
+    opPP  = &opP->next;
+  }
+
+  pthread_mutex_unlock(&mutex);
+
+  while (refusedP != NULL)
+  {
+    Op* nextP = refusedP->next;
+
+    notConnected(refusedP->invP->err, sizeof(refusedP->invP->err));
+    inventoryDone(refusedP->invP);
+    opFree(refusedP);
+    refusedP = nextP;
+  }
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
 // opsRun - the queued broker calls, on the client's thread
 //
 static void opsRun(void)
@@ -1316,6 +1569,19 @@ static void opsRun(void)
   while (opP != NULL)
   {
     Op* nextP = opP->next;
+
+    if (opP->type == OpInventory)
+    {
+      if (connected == true)
+        inventoryRun(opP->invP);
+      else
+        notConnected(opP->invP->err, sizeof(opP->invP->err));
+
+      inventoryDone(opP->invP);
+      opFree(opP);
+      opP = nextP;
+      continue;
+    }
 
     pthread_mutex_lock(&mutex);
     Endpoint* eP = endpointFind(opP->endpoint);
@@ -1385,7 +1651,9 @@ static bool connect(void)
 
     if (strcmp(reason, unreachableReason) != 0)       // said once, not on every retry
     {
+      pthread_mutex_lock(&mutex);                     // read by a broker thread too (notConnected)
       snprintf(unreachableReason, sizeof(unreachableReason), "%s", reason);
+      pthread_mutex_unlock(&mutex);
       COR_W("opcua: %s", reason);
 
       //
@@ -1407,7 +1675,9 @@ static bool connect(void)
     return false;
   }
 
+  pthread_mutex_lock(&mutex);
   unreachableReason[0] = 0;
+  pthread_mutex_unlock(&mutex);
 
   UA_CreateSubscriptionRequest request = UA_CreateSubscriptionRequest_default();
 
@@ -1487,7 +1757,10 @@ static void* clientThread(void* arg)
       if (connect() == false)
       {
         for (int ix = 0; (ix < 20) && (stopping == false); ix++)   // 2 s between attempts, stopping in 100 ms
+        {
+          inventoriesRefuse();
           usleep(100 * 1000);
+        }
         continue;
       }
     }
@@ -1828,6 +2101,98 @@ int opcuaTransportSend(const char* endpoint, const char* json)
 
   opPush(OpWrite, endpoint, &value, strdup(json));
   return BRIDGE_OK;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// opcuaTransportInventory -
+//
+int opcuaTransportInventory(const char* from, int depth, int timeoutMs, char** jsonP, char* errBuf, int errBufLen)
+{
+  *jsonP = NULL;
+
+  if (connected == false)
+  {
+    notConnected(errBuf, errBufLen);
+    return BRIDGE_ERR;
+  }
+
+  InventoryReq* reqP = (InventoryReq*) calloc(1, sizeof(InventoryReq));
+
+  if (reqP == NULL)
+    return BRIDGE_ERR;
+
+  reqP->from  = (from != NULL) ? strdup(from) : NULL;
+  reqP->depth = (depth < 0) ? 0 : ((depth > 5) ? 5 : depth);    // at most 5 levels at once: a tool asks again below
+  reqP->r     = BRIDGE_ERR;
+  pthread_cond_init(&reqP->cond, NULL);
+
+  Op* opP = (Op*) calloc(1, sizeof(Op));
+
+  if (opP == NULL)
+  {
+    free(reqP->from);
+    pthread_cond_destroy(&reqP->cond);
+    free(reqP);
+    return BRIDGE_ERR;
+  }
+
+  opP->type = OpInventory;
+  opP->invP = reqP;
+  UA_Variant_init(&opP->value);
+
+  pthread_mutex_lock(&mutex);
+
+  if (opsTail == NULL)
+    opsHead = opP;
+  else
+    opsTail->next = opP;
+  opsTail = opP;
+
+  //
+  // Waited for, up to timeoutMs - past it the request is left to the client's thread to free
+  //
+  struct timespec until;
+
+  clock_gettime(CLOCK_REALTIME, &until);
+  until.tv_sec  += timeoutMs / 1000;
+  until.tv_nsec += (long) (timeoutMs % 1000) * 1000000;
+  if (until.tv_nsec >= 1000000000)
+  {
+    until.tv_sec  += 1;
+    until.tv_nsec -= 1000000000;
+  }
+
+  while ((reqP->done == false) && (pthread_cond_timedwait(&reqP->cond, &mutex, &until) == 0))
+    ;
+
+  if (reqP->done == false)
+  {
+    reqP->abandoned = true;
+    pthread_mutex_unlock(&mutex);
+    snprintf(errBuf, errBufLen, "the OPC UA server did not answer within %d ms", timeoutMs);
+    return BRIDGE_ERR;
+  }
+
+  pthread_mutex_unlock(&mutex);
+
+  int r = reqP->r;
+
+  if (r == BRIDGE_OK)
+    *jsonP = reqP->json;
+  else
+  {
+    snprintf(errBuf, errBufLen, "%s", reqP->err);
+    free(reqP->json);
+  }
+
+  free(reqP->from);
+  pthread_cond_destroy(&reqP->cond);
+  free(reqP);
+
+  return r;
 }
 
 

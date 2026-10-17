@@ -223,3 +223,58 @@ for c in sorted(json.load(sys.stdin), key=lambda c: c["channelTarget"]):
   line = "%s %s samplesIn=%s samplesOut=%s" % (c["channelTarget"], c["status"], c.get("samplesIn"), c.get("samplesOut"))
   print(line if c["status"] == "available" else "%s - %s" % (line, c.get("statusReason")))'
 }
+
+
+# -----------------------------------------------------------------------------
+#
+# inventory [query] - GET /admin/bridges/opcua/inventory[?query]: the HTTP status, then the body (the broker
+# started with --apiPlugins admin)
+#
+inventory() {
+  curl -s -w "\n%{http_code}\n" "localhost:$OPCUA_PORT/admin/bridges/opcua/inventory${1:+?$1}" | python3 -c 'import sys
+lines = sys.stdin.read().rstrip("\n").split("\n")
+print(lines[-1])
+print("\n".join(lines[:-1]))'
+}
+
+
+# -----------------------------------------------------------------------------
+#
+# inventoryAwait <query> <text> [seconds] - wait until GET /admin/bridges/opcua/inventory[?query] answers with
+# <text> in it, then print it as inventory does; the last answer on stderr if it does not within [seconds]
+# (default 10) of the clock - a request that hangs counts its time
+#
+inventoryAwait() {
+  local url="localhost:$OPCUA_PORT/admin/bridges/opcua/inventory${1:+?$1}" secs="${3:-10}"
+  local end=$(( $(date +%s) + secs ))
+  while [ "$(date +%s)" -lt "$end" ]; do
+    curl -s -m "$secs" "$url" | grep -qF -- "$2" && { inventory "$1"; return 0; }
+    sleep 0.1
+  done
+  echo "inventoryAwait: $url is $(curl -s "$url"), without '$2', after ${secs}s" >&2
+  return 1
+}
+
+
+# -----------------------------------------------------------------------------
+#
+# inventoryServerDies <query> - GET /admin/bridges/opcua/inventory[?query] while the server dies: the server
+# frozen (SIGSTOP), the request sent, the server killed while the bridge waits for its answer - then printed
+# as inventory does
+#
+inventoryServerDies() {
+  local pid answer="$OPCUA_TEST_DIR/inventory.answer" cpid
+  pid=$(cat "$OPCUA_TEST_DIR/server.pid")
+  kill -STOP "$pid"
+  curl -s -w "\n%{http_code}\n" "localhost:$OPCUA_PORT/admin/bridges/opcua/inventory${1:+?$1}" > "$answer" &
+  cpid=$!
+  sleep 0.5
+  kill -9 "$pid"
+  wait "$pid" 2>/dev/null
+  rm -f "$OPCUA_TEST_DIR/server.pid"
+  wait "$cpid"
+  python3 -c 'import sys
+lines = open(sys.argv[1]).read().rstrip("\n").split("\n")
+print(lines[-1])
+print("\n".join(lines[:-1]))' "$answer"
+}
