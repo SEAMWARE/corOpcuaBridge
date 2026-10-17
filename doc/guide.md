@@ -429,8 +429,8 @@ depth asked for. An Object is a candidate AssetChannel root.
 | Answer | When |
 |---|---|
 | 200 | the tree |
-| 404 | no bridge `opcua` loaded, or the server has no node `from` |
-| 501 | the broker or the bridge is older than the inventory (bridge ABI 14) |
+| 404 | no bridge `opcua` loaded, the server has no node `from` - or a broker older than the inventory, which has no such URL |
+| 501 | a bridge older than the inventory (bridge ABI 14), or a broker built without it (`COR_FEATURE_BRIDGE_INVENTORY`) |
 | 503 | the bridge has no connection to the server - with the reason (section 7) |
 
 c³'s mapping page is to browse this way and write the configuration of sections 4 and 5 from what you
