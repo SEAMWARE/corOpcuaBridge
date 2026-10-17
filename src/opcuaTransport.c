@@ -42,6 +42,7 @@
 #include "corTree/corTreeLookup.h"                    // corTreeLookup
 #include "corBridge/BridgeBroker.h"                   // BRIDGE_*
 
+#include "opcuaSecurity.h"                            // opcuaSecurityConfigure
 #include "opcuaTransport.h"                           // Own interface
 
 
@@ -1367,7 +1368,20 @@ static bool connect(void)
   {
     char reason[256];
 
-    snprintf(reason, sizeof(reason), "the OPC UA server %s cannot be reached (%s)", serverUrl, UA_StatusCode_name(sc));
+    //
+    // Not there, or there and saying no - a wrong password or an untrusted certificate is not a network
+    // problem, and the reason must not send anyone looking for one
+    //
+    bool network = (sc == UA_STATUSCODE_BADCONNECTIONREJECTED) || (sc == UA_STATUSCODE_BADCONNECTIONCLOSED) ||
+                   (sc == UA_STATUSCODE_BADTIMEOUT) || (sc == UA_STATUSCODE_BADCOMMUNICATIONERROR) ||
+                   (sc == UA_STATUSCODE_BADNOTCONNECTED) || (sc == UA_STATUSCODE_BADDISCONNECT) ||
+                   (sc == UA_STATUSCODE_BADSECURECHANNELCLOSED) || (sc == UA_STATUSCODE_BADSERVERNOTCONNECTED) ||
+                   (sc == UA_STATUSCODE_BADTCPENDPOINTURLINVALID) || (sc == UA_STATUSCODE_BADRESOURCEUNAVAILABLE);
+
+    if (network == true)
+      snprintf(reason, sizeof(reason), "the OPC UA server %s cannot be reached (%s)", serverUrl, UA_StatusCode_name(sc));
+    else
+      snprintf(reason, sizeof(reason), "the OPC UA server %s refused the connection (%s)", serverUrl, UA_StatusCode_name(sc));
 
     if (strcmp(reason, unreachableReason) != 0)       // said once, not on every retry
     {
@@ -1562,8 +1576,11 @@ int opcuaTransportOpen(CorNode* serverP, OpcuaReceiveFunc receiveF, OpcuaStatusF
   memset(&config, 0, sizeof(config));
   config.logging = &logger;
 
-  if (UA_ClientConfig_setDefault(&config) != UA_STATUSCODE_GOOD)
+  if (opcuaSecurityConfigure(serverP, &config) == false)   // the defaults, the SecureChannel, the user
+  {
+    UA_ClientConfig_clear(&config);
     return BRIDGE_ERR;
+  }
 
   config.timeout = 2000;                              // ms - a service call that waits longer has failed
 

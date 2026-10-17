@@ -76,7 +76,10 @@ brokerStop() {
 
 # -----------------------------------------------------------------------------
 #
-# serverStart - the tests' OPC UA server (test/opcuaTestServer - `make server`), on $OPCUA_SERVER_PORT
+# serverStart [cert dir] - the tests' OPC UA server (test/opcuaTestServer - `make server`), on $OPCUA_SERVER_PORT
+#
+# With a [cert dir] (made by `$OPCUA_SERVER --makeCerts <dir>`), the server is secure - see
+# test/opcuaTestServer.c.
 #
 # Its address space is described in test/opcuaTestServer.c: a press (an AssetChannel's model) and a tank
 # (plain Channels). Returns once the port answers.
@@ -88,7 +91,7 @@ serverStart() {
   mkfifo "$OPCUA_TEST_DIR/server.cmd"
   : > "$OPCUA_TEST_DIR/server.writes"
 
-  "$OPCUA_SERVER" "$OPCUA_SERVER_PORT" "$OPCUA_TEST_DIR/server.cmd" "$OPCUA_TEST_DIR/server.writes" \
+  "$OPCUA_SERVER" "$OPCUA_SERVER_PORT" "$OPCUA_TEST_DIR/server.cmd" "$OPCUA_TEST_DIR/server.writes" $1 \
                   > "$OPCUA_TEST_DIR/server.log" 2>&1 &
   echo $! > "$OPCUA_TEST_DIR/server.pid"
 
