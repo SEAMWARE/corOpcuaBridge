@@ -396,6 +396,46 @@ c³, the coraine Control Center:
   once, when the broker is started; c³ keeps it in the broker's directory, readable by you only, and
   never shows it again.
 
+### Browsing the server: the inventory
+
+To find the NodeIds to configure, ask the broker what the server has. With the broker's `admin` API
+plugin loaded (`--apiPlugins admin`):
+
+    curl 'localhost:1026/admin/bridges/opcua/inventory?from=ns%3D2%3Bs%3DPress17&depth=1'
+
+- `from` - the NodeId to start at, URL-encoded (`ns=2;s=Press17` -> `ns%3D2%3Bs%3DPress17`); without it,
+  the server's Objects folder.
+- `depth` - how many levels below it (default 1, at most 5 in one request: ask again further down).
+
+The answer is the node tree, in the same shape the bridge hands the broker for an AssetChannel - for the
+test server's press, one level (abridged):
+
+```json
+{ "node": "object", "id": "ns=2;s=Press17", "name": "Press17",
+  "typeName": "PressType", "typeDefinition": "ns=2;s=PressType", "semanticIds": [ "0173-1#01-AKJ975#017" ],
+  "children": [
+    { "node": "folder", "id": "ns=2;s=P17.Hydraulics", "name": "Hydraulics", "hasChildren": true },
+    { "node": "variable", "id": "ns=2;s=P17.Mode", "name": "Mode",
+      "dataType": "String", "writable": true, "value": "auto", "sourceTime": "2026-10-17T10:00:00.000Z" },
+    { "node": "object", "id": "ns=2;s=P17.Unit1", "name": "Unit1", "typeName": "HydraulicUnitType",
+      "hasChildren": true, "references": [ { "type": "HasEffect", "target": "ns=2;s=Press17" } ] },
+    { "node": "method", "id": "ns=2;s=P17.Start", "name": "Start" } ] }
+```
+
+A Variable shows its DataType, whether the bridge's user may write it (`writable`), its unit and its
+value - what decides whether it is a good Channel. `hasChildren` marks a node with more below it than the
+depth asked for. An Object is a candidate AssetChannel root.
+
+| Answer | When |
+|---|---|
+| 200 | the tree |
+| 404 | no bridge `opcua` loaded, the server has no node `from` - or a broker older than the inventory, which has no such URL |
+| 501 | a bridge older than the inventory (bridge ABI 14), or a broker built without it (`COR_FEATURE_BRIDGE_INVENTORY`) |
+| 503 | the bridge has no connection to the server - with the reason (section 7) |
+
+c³'s mapping page is to browse this way and write the configuration of sections 4 and 5 from what you
+pick.
+
 ## 9. What it does not do yet
 
 - **Methods** - an OPC UA Method makes nothing yet. They are to become services of their entity (NGSI-LD

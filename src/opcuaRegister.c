@@ -376,5 +376,10 @@ __attribute__((visibility("default"))) void bridgeRegister(BridgeDriver* driverP
   if (driverP->abiVersion >= 9)
     driverP->channelAddInfo = opcuaChannelAddInfo;
 
+#if BRIDGE_ABI_VERSION >= 14
+  if (driverP->abiVersion >= 14)
+    driverP->inventory = opcuaTransportInventory;     // for a mapping tool: the address space
+#endif
+
   driverP->abiVersion  = BRIDGE_ABI_VERSION;
 }

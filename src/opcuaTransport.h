@@ -131,6 +131,19 @@ extern int opcuaTransportSend(const char* endpoint, const char* json);
 
 // -----------------------------------------------------------------------------
 //
+// opcuaTransportInventory - the server's address space, for a mapping tool: the node tree from 'from' (a NodeId;
+// NULL: the Objects folder), 'depth' levels down (at most 5), as AssetChannel.h's neutral node tree with, for a
+// Variable, its "dataType" and whether it is "writable", and "hasChildren" where the depth ended. Waits for the
+// client's thread up to timeoutMs. *jsonP malloc'd - the caller frees it
+//
+// @return BRIDGE_OK, BRIDGE_NOT_FOUND (no such node), BRIDGE_ERR (not connected, timed out) - errBuf says why
+//
+extern int opcuaTransportInventory(const char* from, int depth, int timeoutMs, char** jsonP, char* errBuf, int errBufLen);
+
+
+
+// -----------------------------------------------------------------------------
+//
 // opcuaTransportVersion - "open62541 1.4.11"
 //
 extern const char* opcuaTransportVersion(void);
