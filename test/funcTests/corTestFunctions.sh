@@ -6,15 +6,21 @@
 # of its own, with ramDB as its store: no database server is needed. A test waits on and asserts on what
 # the API says, never on the broker's log - the log is kept for reading when a test fails.
 #
-#   OPCUA_BROKER   the broker binary (default: coraine on PATH - the coraine package, or
-#                 `. <dir>/install/env` after coraine-build)
-#   OPCUA_PORT     its port (default 19026 - clear of a broker on 1026 and of coraine's own test ports)
-#   OPCUA_PLUGIN   the plugin under test (default: opcua.so in this repo)
-#   OPCUA_TEST_DIR scratch directory: the bridge configuration, the device files, the broker's pid and log
+#   OPCUA_BROKER       the broker binary (default: coraine on PATH - the coraine package, or
+#                      `. <dir>/install/env` after coraine-build); AssetChannels need coraine 0.6 with
+#                      COR_FEATURE_ASSET_CHANNELS
+#   OPCUA_PORT         its port (default 19026 - clear of a broker on 1026 and of coraine's own test ports)
+#   OPCUA_PLUGIN       the plugin under test (default: opcua.so in this repo)
+#   OPCUA_SERVER       the tests' OPC UA server (default: test/opcuaTestServer in this repo - `make server`)
+#   OPCUA_SERVER_PORT  its port (default 14840 - clear of a real server on 4840)
+#   OPCUA_TEST_DIR     scratch directory: the bridge configuration, the server's fifo and writes, the pids and logs
 #
+OPCUA_REPO="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 OPCUA_BROKER="${OPCUA_BROKER:-coraine}"
 OPCUA_PORT="${OPCUA_PORT:-19026}"
-OPCUA_PLUGIN="${OPCUA_PLUGIN:-${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}/opcua.so}"
+OPCUA_PLUGIN="${OPCUA_PLUGIN:-$OPCUA_REPO/opcua.so}"
+OPCUA_SERVER="${OPCUA_SERVER:-$OPCUA_REPO/test/opcuaTestServer}"
+OPCUA_SERVER_PORT="${OPCUA_SERVER_PORT:-14840}"
 OPCUA_TEST_DIR="${OPCUA_TEST_DIR:-/tmp/opcua-bridge-test}"
 
 
@@ -70,36 +76,88 @@ brokerStop() {
 
 # -----------------------------------------------------------------------------
 #
-# deviceWrite <endpoint> <content> [time] - the device produces a value: its file, written whole
+# serverStart - the tests' OPC UA server (test/opcuaTestServer - `make server`), on $OPCUA_SERVER_PORT
 #
-# Written beside it and renamed, so the bridge never reads half a value. [time] (ISO 8601) sets the
-# file's modification time, which the bridge reports as the value's time - observedAt.
+# Its address space is described in test/opcuaTestServer.c: a press (an AssetChannel's model) and a tank
+# (plain Channels). Returns once the port answers.
 #
-deviceWrite() {
-  local file="$OPCUA_TEST_DIR/device/$1"
+serverStart() {
+  serverStop
 
-  mkdir -p "$(dirname "$file")"
-  echo "$2" > "$file.new"
-  [ -z "$3" ] || touch -d "$3" "$file.new"
-  mv "$file.new" "$file"
+  rm -f "$OPCUA_TEST_DIR/server.cmd"
+  mkfifo "$OPCUA_TEST_DIR/server.cmd"
+  : > "$OPCUA_TEST_DIR/server.writes"
+
+  "$OPCUA_SERVER" "$OPCUA_SERVER_PORT" "$OPCUA_TEST_DIR/server.cmd" "$OPCUA_TEST_DIR/server.writes" \
+                  > "$OPCUA_TEST_DIR/server.log" 2>&1 &
+  echo $! > "$OPCUA_TEST_DIR/server.pid"
+
+  local i
+  for ((i = 0; i < 100; i++)); do
+    (exec 3<>"/dev/tcp/localhost/$OPCUA_SERVER_PORT") 2>/dev/null && return 0
+    sleep 0.1
+  done
+
+  echo "serverStart: no answer on port $OPCUA_SERVER_PORT after 10s - $OPCUA_TEST_DIR/server.log:" >&2
+  tail -20 "$OPCUA_TEST_DIR/server.log" >&2
+  return 1
 }
 
 
 # -----------------------------------------------------------------------------
 #
-# deviceAwait <endpoint> <content> [seconds] - wait until the device's file holds <content>, then print it
+# serverStop - stop the server serverStart started (by its pid)
 #
-deviceAwait() {
-  local file="$OPCUA_TEST_DIR/device/$1" secs="${3:-10}" i
+serverStop() {
+  local pidFile="$OPCUA_TEST_DIR/server.pid"
+  [ -f "$pidFile" ] || return 0
+
+  local pid i
+  pid=$(cat "$pidFile")
+  kill "$pid" 2>/dev/null
+  for ((i = 0; i < 50; i++)); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  kill -9 "$pid" 2>/dev/null
+  rm -f "$pidFile"
+}
+
+
+# -----------------------------------------------------------------------------
+#
+# deviceSet <node id> <JSON value> <ISO 8601 time> - the server's own value changes, as a device's would,
+# its SourceTimestamp the time given (the observedAt it becomes)
+#
+deviceSet() {
+  echo "set $1 $3 $2" > "$OPCUA_TEST_DIR/server.cmd"
+}
+
+
+# -----------------------------------------------------------------------------
+#
+# deviceAwaitWrite <node id> <value> [seconds] - wait until a client has written <value> to the node, then
+# print the write as the server recorded it
+#
+deviceAwaitWrite() {
+  local secs="${3:-10}" i
 
   for ((i = 0; i < secs * 10; i++)); do
-    [ "$(cat "$file" 2>/dev/null)" == "$2" ] && { cat "$file"; return 0; }
+    grep -qxF -- "$1 $2" "$OPCUA_TEST_DIR/server.writes" && { echo "$1 $2"; return 0; }
     sleep 0.1
   done
 
-  echo "deviceAwait: '$1' holds '$(cat "$file" 2>/dev/null)', not '$2', after ${secs}s" >&2
-  cat "$file" 2>/dev/null
+  echo "deviceAwaitWrite: no write of '$2' to '$1' after ${secs}s - the writes: $(cat "$OPCUA_TEST_DIR/server.writes")" >&2
   return 1
+}
+
+
+# -----------------------------------------------------------------------------
+#
+# deviceWrites - every write the server has recorded
+#
+deviceWrites() {
+  cat "$OPCUA_TEST_DIR/server.writes"
 }
 
 
@@ -137,6 +195,18 @@ entityGet() {
 attrPatch() {
   curl -s -o /dev/null -w "%{http_code}\n" -X PATCH "localhost:$OPCUA_PORT/ngsi-ld/v1/entities/$1/attrs/$2" \
        -H 'Content-Type: application/json' -d "$3"
+}
+
+
+# -----------------------------------------------------------------------------
+#
+# assetChannels - one line per AssetChannel: endpoint, status, counters - and why, when it is dormant
+#
+assetChannels() {
+  curl -s "localhost:$OPCUA_PORT/ngsi-ld/v1/assetChannels" | python3 -c 'import sys, json
+for c in sorted(json.load(sys.stdin), key=lambda c: c["channelTarget"]):
+  line = "%s %s modelsIn=%s valuesIn=%s valuesRefused=%s entitiesWritten=%s" % (c["channelTarget"], c["status"], c.get("modelsIn"), c.get("valuesIn"), c.get("valuesRefused"), c.get("entitiesWritten"))
+  print(line if c["status"] == "available" else "%s - %s" % (line, c.get("statusReason")))'
 }
 
 

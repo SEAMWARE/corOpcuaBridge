@@ -1,0 +1,152 @@
+#
+# FILE            bridge_opcua_channels.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# Channels on OPC UA Variables - an endpoint is a NodeId, its value an entity attribute, both ways:
+#
+#   in    the Variable's value, and each change the server reports (a monitored item), its SourceTimestamp
+#         the attribute's observedAt
+#   out   a write to the attribute is a Write to the Variable, converted to its DataType; a value that does
+#         not fit the DataType is refused before anything is stored (400)
+#   echo  the bridge's own Write does not come back as a sample - samplesIn stays 1 (the initial value)
+#
+# A node the server does not have, and an endpoint that is no NodeId, are refused: the Channel stays,
+# dormant, with the reason.
+#
+--NAME--
+opcua bridge - Channels on Variables: values in, Writes out, the DataType checked, no echo, unknown nodes dormant
+
+--TAGS--
+bridge opcua
+
+--INIT--
+rm -rf "${OPCUA_TEST_DIR:?}"
+mkdir -p "$OPCUA_TEST_DIR"
+cat > $OPCUA_TEST_DIR/bridges.json <<J
+{ "opcua": { "server": { "url": "opc.tcp://localhost:$OPCUA_SERVER_PORT", "publishingIntervalMs": 100, "samplingIntervalMs": 50 },
+             "ngsild": { "defaultEntity": false, "topics": {
+               "ns=2;s=Tank1.Level":    { "entityId": "urn:ngsi-ld:Tank:T1", "entityType": "Tank", "attribute": "level" },
+               "ns=2;s=Tank1.Setpoint": { "entityId": "urn:ngsi-ld:Tank:T1", "entityType": "Tank", "attribute": "setpoint" },
+               "ns=2;s=Tank1.Name":     { "entityId": "urn:ngsi-ld:Tank:T1", "entityType": "Tank", "attribute": "name" },
+               "ns=2;s=Tank1.Nope":     { "entityId": "urn:ngsi-ld:Tank:T1", "entityType": "Tank", "attribute": "nope" },
+               "Tank1.Level":           { "entityId": "urn:ngsi-ld:Tank:T1", "entityType": "Tank", "attribute": "notANodeId" } } } } }
+J
+serverStart
+brokerStart
+
+--RUN--
+echo "01. The tank's values, read when the Channels are added"
+echo "======================================================="
+entityAwait urn:ngsi-ld:Tank:T1 level '"level": 1.5'
+entityGet urn:ngsi-ld:Tank:T1 level,setpoint,name keyValues
+echo
+echo
+
+
+echo "02. The level changes on the server, at its own time - the attribute follows, observedAt the SourceTimestamp"
+echo "============================================================================================================"
+deviceSet "ns=2;s=Tank1.Level" 2.25 2026-10-17T10:00:05Z
+entityAwait urn:ngsi-ld:Tank:T1 level '"level": 2.25'
+entityGet urn:ngsi-ld:Tank:T1 level
+echo
+echo
+
+
+echo "03. PATCH setpoint 70 and name \"Tank one\" - the server receives the Writes, as its DataTypes (Double, String)"
+echo "============================================================================================================="
+attrPatch urn:ngsi-ld:Tank:T1 setpoint '{"value": 70}'
+attrPatch urn:ngsi-ld:Tank:T1 name '{"value": "Tank one"}'
+deviceAwaitWrite "ns=2;s=Tank1.Setpoint" 70
+deviceAwaitWrite "ns=2;s=Tank1.Name" '"Tank one"'
+echo
+echo
+
+
+echo "04. PATCH setpoint \"hot\" - not a Double: refused before anything is stored (400), setpoint stays 70"
+echo "==================================================================================================="
+attrPatch urn:ngsi-ld:Tank:T1 setpoint '{"value": "hot"}'
+entityGet urn:ngsi-ld:Tank:T1 setpoint keyValues
+echo
+echo
+
+
+echo "05. GET /channels - the unknown node and the endpoint that is no NodeId dormant, and why; no echo of the Writes"
+echo "==============================================================================================================="
+sleep 0.5                                             # five publishing intervals: time for an echo to show, were there one
+channels
+echo
+echo
+
+
+echo "06. The server received two Writes, nothing else"
+echo "================================================"
+deviceWrites
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+serverStop
+rm -f "${OPCUA_TEST_DIR:?}/bridges.json" "$OPCUA_TEST_DIR/server.cmd"       # the logs stay, for a failure
+
+--EXPECT--
+01. The tank's values, read when the Channels are added
+=======================================================
+{
+  "id": "urn:ngsi-ld:Tank:T1",
+  "level": 1.5,
+  "name": "T1",
+  "setpoint": 0,
+  "type": "Tank"
+}
+
+
+02. The level changes on the server, at its own time - the attribute follows, observedAt the SourceTimestamp
+============================================================================================================
+{
+  "id": "urn:ngsi-ld:Tank:T1",
+  "level": {
+    "observedAt": "2026-10-17T10:00:05Z",
+    "type": "Property",
+    "value": 2.25
+  },
+  "type": "Tank"
+}
+
+
+03. PATCH setpoint 70 and name "Tank one" - the server receives the Writes, as its DataTypes (Double, String)
+=============================================================================================================
+204
+204
+ns=2;s=Tank1.Setpoint 70
+ns=2;s=Tank1.Name "Tank one"
+
+
+04. PATCH setpoint "hot" - not a Double: refused before anything is stored (400), setpoint stays 70
+===================================================================================================
+400
+{
+  "id": "urn:ngsi-ld:Tank:T1",
+  "setpoint": 70,
+  "type": "Tank"
+}
+
+
+05. GET /channels - the unknown node and the endpoint that is no NodeId dormant, and why; no echo of the Writes
+===============================================================================================================
+Tank1.Level dormant samplesIn=0 samplesOut=0 - not an OPC UA NodeId (ns=<namespace>;i=<number>, ns=<namespace>;s=<string>, ...)
+ns=2;s=Tank1.Level available samplesIn=2 samplesOut=0
+ns=2;s=Tank1.Name available samplesIn=1 samplesOut=1
+ns=2;s=Tank1.Nope dormant samplesIn=0 samplesOut=0 - the OPC UA server has no node 'ns=2;s=Tank1.Nope' (BadNodeIdUnknown)
+ns=2;s=Tank1.Setpoint available samplesIn=1 samplesOut=1
+
+
+06. The server received two Writes, nothing else
+================================================
+ns=2;s=Tank1.Setpoint 70
+ns=2;s=Tank1.Name "Tank one"
+
+

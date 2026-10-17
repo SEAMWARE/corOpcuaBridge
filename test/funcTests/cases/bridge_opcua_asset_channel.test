@@ -1,0 +1,137 @@
+#
+# FILE            bridge_opcua_asset_channel.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# An AssetChannel on an OPC UA Object - the object and what it contains, browsed and handed over as the
+# neutral node tree; the broker makes it a graph of entities (coraine's doc/asset-channels.md):
+#
+#   Press17     a PressType - its HasDictionaryEntry the semanticId (the IRDI, not the server's node id);
+#               the Hydraulics folder's Variables attributes named by their path, their EngineeringUnits
+#               the unitCode, their SourceTimestamp the observedAt; Unit1 a Relationship
+#   Unit1       an entity of its own (a HydraulicUnitType); its HasEffect reference to the press a
+#               Relationship
+#   Start       a method - nothing yet
+#
+# A Variable of the model changes on the server: the press is written again, the pressure 214.
+#
+# REQUIRE_FEATURE: ASSET_CHANNELS
+#
+--NAME--
+opcua bridge - an AssetChannel: an Object browsed into a graph of entities, its Variables' changes written
+
+--TAGS--
+bridge opcua
+
+--INIT--
+rm -rf "${OPCUA_TEST_DIR:?}"
+mkdir -p "$OPCUA_TEST_DIR"
+cat > $OPCUA_TEST_DIR/bridges.json <<J
+{ "opcua": { "server": { "url": "opc.tcp://localhost:$OPCUA_SERVER_PORT", "publishingIntervalMs": 100, "samplingIntervalMs": 50 },
+             "ngsild": { "defaultEntity": false, "assetChannels": {
+               "ns=2;s=Press17": { "entities": "natural" } } } } }
+J
+serverStart
+brokerStart
+
+--RUN--
+echo "01. The press - its type, its meaning, its folder's Variables by their path, a Relationship to its unit"
+echo "======================================================================================================="
+entityAwait urn:ngsi-ld:PressType:Press17 mode '"mode": "auto"'
+entityGet urn:ngsi-ld:PressType:Press17 semanticId,hydraulicsPressure,hydraulicsOilTemp,mode,unit1
+echo
+echo
+
+
+echo "02. The unit - an entity of its own; its HasEffect reference a Relationship to the press"
+echo "========================================================================================"
+entityGet urn:ngsi-ld:HydraulicUnitType:Press17:Unit1 running,hasEffect keyValues
+echo
+echo
+
+
+echo "03. The pressure changes on the server at 10:00:05 - the press is written again, observedAt that time"
+echo "====================================================================================================="
+deviceSet "ns=2;s=P17.Pressure" 214 2026-10-17T10:00:05Z
+entityAwait urn:ngsi-ld:PressType:Press17 hydraulicsPressure '"hydraulicsPressure": 214'
+entityGet urn:ngsi-ld:PressType:Press17 hydraulicsPressure
+echo
+echo
+
+
+echo "04. GET /assetChannels - one model, one value"
+echo "============================================="
+assetChannels
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+serverStop
+rm -f "${OPCUA_TEST_DIR:?}/bridges.json" "$OPCUA_TEST_DIR/server.cmd"
+
+--EXPECT--
+01. The press - its type, its meaning, its folder's Variables by their path, a Relationship to its unit
+=======================================================================================================
+{
+  "hydraulicsOilTemp": {
+    "observedAt": "2026-10-17T10:00:00Z",
+    "type": "Property",
+    "unitCode": "CEL",
+    "value": 48.1
+  },
+  "hydraulicsPressure": {
+    "observedAt": "2026-10-17T10:00:00Z",
+    "type": "Property",
+    "unitCode": "BAR",
+    "value": 212.5
+  },
+  "id": "urn:ngsi-ld:PressType:Press17",
+  "mode": {
+    "observedAt": "2026-10-17T10:00:00Z",
+    "type": "Property",
+    "value": "auto"
+  },
+  "semanticId": {
+    "type": "Property",
+    "value": "0173-1#01-AKJ975#017"
+  },
+  "type": "PressType",
+  "unit1": {
+    "object": "urn:ngsi-ld:HydraulicUnitType:Press17:Unit1",
+    "type": "Relationship"
+  }
+}
+
+
+02. The unit - an entity of its own; its HasEffect reference a Relationship to the press
+========================================================================================
+{
+  "hasEffect": "urn:ngsi-ld:PressType:Press17",
+  "id": "urn:ngsi-ld:HydraulicUnitType:Press17:Unit1",
+  "running": true,
+  "type": "HydraulicUnitType"
+}
+
+
+03. The pressure changes on the server at 10:00:05 - the press is written again, observedAt that time
+=====================================================================================================
+{
+  "hydraulicsPressure": {
+    "observedAt": "2026-10-17T10:00:05Z",
+    "type": "Property",
+    "unitCode": "BAR",
+    "value": 214
+  },
+  "id": "urn:ngsi-ld:PressType:Press17",
+  "type": "PressType"
+}
+
+
+04. GET /assetChannels - one model, one value
+=============================================
+ns=2;s=Press17 available modelsIn=1 valuesIn=1 valuesRefused=0 entitiesWritten=3
+
+

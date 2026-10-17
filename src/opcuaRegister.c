@@ -28,13 +28,13 @@
 // Which endpoint is which attribute is the broker's: the Channels, from the "ngsild" section of this
 // bridge's member of the --bridgeConfig file. The plugin reads the rest of its member ("server").
 //
-// This file stays as it is in a real bridge, apart from the TODOs. The protocol is in opcuaTransport.c.
+// An endpoint is an OPC UA NodeId; what it carries - a value, or a model - is the node's class
+// (opcuaTransport.h). The protocol is in opcuaTransport.c.
 //
 #include <stdbool.h>                                  // bool
 #include <stdio.h>                                    // fopen, fread, fseek, ftell
 #include <stdlib.h>                                   // malloc, free
 #include <string.h>                                   // strdup
-#include <strings.h>                                  // strcasecmp
 
 #include "corLog/corLog.h"                            // COR_E, COR_W
 #include "corAlloc/CorAlloc.h"                        // CorAlloc
@@ -85,6 +85,25 @@ static void opcuaReceive(const char* endpoint, const char* json, int64_t timeNs)
 
   if ((r != BRIDGE_OK) && (r != BRIDGE_NOT_FOUND))
     COR_W("opcua: the value on '%s' was not taken (%d)", endpoint, r);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// opcuaStatus - the transport says whether an endpoint can be carried, and why not: GET /ngsi-ld/v1/channels
+// (or /assetChannels) shows it - the server cannot be reached, has no such node, is back
+//
+static void opcuaStatus(const char* endpoint, bool available, const char* reason)
+{
+#if BRIDGE_ABI_VERSION >= 12
+  if ((brokerP != NULL) && (brokerP->abiVersion >= 12) && (brokerP->channelStatusIn != NULL))
+    brokerP->channelStatusIn("opcua", endpoint, (available == true) ? BridgeChannelAvailable : BridgeChannelDormant, reason);
+#else
+  (void) endpoint;
+  (void) available;
+  (void) reason;
+#endif
 }
 
 
@@ -155,11 +174,11 @@ static int opcuaInit(const char* configFile, const BridgeBroker* _brokerP)
   }
 
   //
-  // TODO: whatever your transport needs to connect - a URL, credentials, a poll period - goes in
-  //       "server", and opcuaTransportOpen reads it. Connect without waiting for the peer if you can:
-  //       the broker's startup should not hang, or fail, on a device that is not up yet.
+  // "server": { "url": "opc.tcp://<host>:<port>", "publishingIntervalMs": 500, "samplingIntervalMs": 250 } -
+  // the client connects on its own thread: a server that is not up yet makes the endpoints dormant, it
+  // does not hold the broker's startup
   //
-  int r = opcuaTransportOpen(serverP, opcuaReceive);
+  int r = opcuaTransportOpen(serverP, opcuaReceive, opcuaStatus);
 
   corAllocBufferReset(&ka, false);                    // nothing parsed here is kept
   free(text);                                         // after the tree: its strings point into it
@@ -182,61 +201,27 @@ static void opcuaClose(void)
 
 // -----------------------------------------------------------------------------
 //
-// channelInfoText - "format" out of a Channel's channelInfo: false (and *whyP) for anything else
+// channelInfoNone - this bridge takes no channelInfo keys yet: any is refused (*whyP)
 //
 // channelInfo is how to read or carry an endpoint - JSON text, an array of {"key": "...", "value": "..."},
-// both strings, or NULL. The broker checks that shape and never a key: a key the plugin does not know is
-// the plugin's to refuse.
+// or NULL. The broker checks that shape and never a key: a key the plugin does not know is the plugin's to
+// refuse. An empty array is no key.
 //
-// TODO: your transport's keys (a QoS, a data type, a scale factor)
-//
-static bool channelInfoText(const char* info, bool* textP, const char** whyP)
+static bool channelInfoNone(const char* info, const char** whyP)
 {
-  *textP = false;
-
   if (info == NULL)
     return true;
 
-  CorAlloc ka;
-  CorJson  cj;
-  char     buf[4096];
-  char*    copy = strdup(info);                       // corJsonParse works in place, and info is the broker's
-  bool     ok;
+  const char* p = info;
 
-  if (copy == NULL)
-    return false;
+  while ((*p == ' ') || (*p == '\n') || (*p == '\t'))
+    p++;
 
-  corAllocBufferInit(&ka, buf, sizeof(buf), 4096, NULL, "opcua channelInfo");
-  corJsonCreate(&cj, &ka);
+  if ((p[0] == '[') && (strchr(p + 1, '{') == NULL))
+    return true;
 
-  CorNode* arrayP = corJsonParse(&cj, copy);
-  ok = (arrayP != NULL) && (arrayP->type == CorArray);
-
-  for (CorNode* pairP = (ok == true) ? arrayP->value.head : NULL; (pairP != NULL) && (ok == true); pairP = pairP->next)
-  {
-    CorNode*    keyP  = corTreeLookup(pairP, "key");
-    CorNode*    valueP = corTreeLookup(pairP, "value");
-    const char* key   = ((keyP   != NULL) && (keyP->type   == CorString)) ? keyP->value.s   : "";
-    const char* value = ((valueP != NULL) && (valueP->type == CorString)) ? valueP->value.s : "";
-
-    if (strcasecmp(key, "format") != 0)
-    {
-      ok    = false;
-      *whyP = "unknown channelInfo key ('format' is the one there is)";
-    }
-    else if (strcmp(value, "text") == 0)
-      *textP = true;
-    else if (strcmp(value, "json") != 0)
-    {
-      ok    = false;
-      *whyP = "format must be 'json' or 'text'";
-    }
-  }
-
-  corAllocBufferReset(&ka, false);
-  free(copy);
-
-  return ok;
+  *whyP = "this bridge takes no channelInfo keys";
+  return false;
 }
 
 
@@ -276,29 +261,28 @@ static void channelRefused(const char* endpoint, const char* why)
 static int opcuaChannelAddInfo(const char* endpoint, BridgeChannelKind kind, BridgeDirection direction, const char* info)
 {
   const char* why = NULL;
-  bool        text;
 
   if (kind != BridgeChannelTopic)
   {
-    COR_E("opcua: '%s': this bridge carries topics only", endpoint);
-    channelRefused(endpoint, "this bridge carries topics only");
+    COR_E("opcua: '%s': this bridge carries topics only (a Variable's value, an Object's model)", endpoint);
+    channelRefused(endpoint, "this bridge carries topics only (a Variable's value, an Object's model)");
     return BRIDGE_UNSUPPORTED;
   }
 
-  if (channelInfoText(info, &text, &why) == false)
+  if (channelInfoNone(info, &why) == false)
   {
-    if (why == NULL)
-      why = "channelInfo is not an array of {key, value}";
-
     COR_E("opcua: '%s': %s", endpoint, why);
     channelRefused(endpoint, why);
     return BRIDGE_BAD_INPUT;
   }
 
-  int r = opcuaTransportEndpointAdd(endpoint, direction, text, &why);
+  int r = opcuaTransportEndpointAdd(endpoint, direction, &why);
 
   if (r != BRIDGE_OK)
+  {
+    COR_E("opcua: '%s': %s", endpoint, (why != NULL) ? why : "the transport would not carry it");
     channelRefused(endpoint, (why != NULL) ? why : "the transport would not carry it");
+  }
 
   return r;
 }
@@ -346,11 +330,12 @@ static int opcuaPublish(const char* endpoint, const char* json)
 //
 // opcuaVersionInfo - one line for GET /version: the plugin, and what it links
 //
-// TODO: your transport library's version, e.g. "opcua 0.1.0 (open62541 1.4.6)"
-//
 static const char* opcuaVersionInfo(void)
 {
-  return "opcua 0.1.0 (file transport)";
+  static char line[96];
+
+  snprintf(line, sizeof(line), "opcua 0.1.0 (%s)", opcuaTransportVersion());
+  return line;
 }
 
 
