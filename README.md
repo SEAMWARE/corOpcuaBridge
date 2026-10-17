@@ -7,6 +7,10 @@ attribute and back, and an OPC UA Object - with everything it contains - into a 
     OPC UA server <-> opcua.so <-> broker <-> Channel       <-> entity attribute   (a Variable)
                                           <-> AssetChannel  <-> entities           (an Object: a model)
 
+**[The guide](doc/guide.md)** - what you configure and what you get, with real examples: Variables and
+Objects, the mapping, security step by step, status and troubleshooting, testing against your own server.
+This README is the reference.
+
 ## Requirements
 
 - **open62541 1.4**, the distribution's: `apt-get install libopen62541-1.4-dev` (to build) or
