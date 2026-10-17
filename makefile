@@ -63,7 +63,7 @@ endif
 
 LIBS          = $(O62541_LIB) -lopen62541 -lpthread
 
-SOURCES       = src/opcuaRegister.c src/opcuaTransport.c
+SOURCES       = src/opcuaRegister.c src/opcuaTransport.c src/opcuaSecurity.c
 OBJS          = $(SOURCES:.c=.o)
 DEPS          = $(SOURCES:.c=.d)
 

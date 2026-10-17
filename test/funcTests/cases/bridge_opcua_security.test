@@ -1,0 +1,134 @@
+#
+# FILE            bridge_opcua_security.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# A secure server - Basic256Sha256 and the other secure SecurityPolicies only (None for discovery), the
+# client's certificate the one it trusts, no anonymous user (test/opcuaTestServer.c). The certificates and
+# the password are made for this run (opcuaTestServer --makeCerts); the bridge reads the password from its
+# file (server.user.passwordFile).
+#
+#   01  SignAndEncrypt, the server's certificate trusted, the right password - the level arrives
+#   02  the wrong password - dormant: the server refused the connection (BadUserAccessDenied)
+#   03  a trust list without the server's certificate - dormant (BadCertificateUntrusted)
+#   04  security None against this server - dormant: no endpoint without security
+#   05  SignAndEncrypt with no trust list and no trustAny - the bridge does not start (it says why)
+#
+--NAME--
+opcua bridge - security: SignAndEncrypt, a user and password, the server's certificate trusted or not
+
+--TAGS--
+bridge opcua
+
+--INIT--
+rm -rf "${OPCUA_TEST_DIR:?}"
+mkdir -p "$OPCUA_TEST_DIR/certs"
+"$OPCUA_SERVER" --makeCerts "$OPCUA_TEST_DIR/certs" > /dev/null
+printf 'not-the-password\n' > "$OPCUA_TEST_DIR/certs/wrong-password"
+serverStart "$OPCUA_TEST_DIR/certs"
+
+--RUN--
+#
+# secureConfig <mode> <trust list JSON> <password file> - the bridge configuration, the level's Channel
+#
+secureConfig() {
+  local c="$OPCUA_TEST_DIR/certs"
+  cat > "$OPCUA_TEST_DIR/bridges.json" <<J
+{ "opcua": { "server": { "url": "opc.tcp://localhost:$OPCUA_SERVER_PORT", "publishingIntervalMs": 100, "samplingIntervalMs": 50,
+               "security": { "mode": "$1", "certificate": "$c/client.der", "privateKey": "$c/client.key",
+                             "applicationUri": "urn:seamware:coraine:opcua-test", "trustList": $2 },
+               "user": { "username": "operator", "passwordFile": "$3" } },
+             "ngsild": { "defaultEntity": false, "topics": {
+               "ns=2;s=Tank1.Level": { "entityId": "urn:ngsi-ld:Tank:T1", "entityType": "Tank", "attribute": "level" } } } } }
+J
+}
+
+C="$OPCUA_TEST_DIR/certs"
+
+echo "01. SignAndEncrypt, the server's certificate trusted, the right password - the level arrives"
+echo "============================================================================================"
+secureConfig SignAndEncrypt "[ \"$C/server.der\" ]" "$C/password"
+brokerStart
+entityAwait urn:ngsi-ld:Tank:T1 level '"level": 1.5'
+channels
+brokerStop
+echo
+echo
+
+
+echo "02. The wrong password - dormant, and why"
+echo "========================================="
+secureConfig SignAndEncrypt "[ \"$C/server.der\" ]" "$C/wrong-password"
+brokerStart
+sleep 1
+channels | sed "s/$OPCUA_SERVER_PORT/PORT/"
+brokerStop
+echo
+echo
+
+
+echo "03. A trust list without the server's certificate - dormant, and why"
+echo "===================================================================="
+secureConfig SignAndEncrypt "[ \"$C/other.der\" ]" "$C/password"
+brokerStart
+sleep 1
+channels | sed "s/$OPCUA_SERVER_PORT/PORT/"
+brokerStop
+echo
+echo
+
+
+echo "04. Security None against a server without it - dormant, and why"
+echo "================================================================"
+secureConfig None "[ \"$C/server.der\" ]" "$C/password"
+brokerStart
+sleep 1
+channels | sed "s/$OPCUA_SERVER_PORT/PORT/"
+brokerStop
+echo
+echo
+
+
+echo "05. SignAndEncrypt, no trust list, no trustAny - the bridge refuses to start, and the broker says why"
+echo "===================================================================================================="
+secureConfig SignAndEncrypt "[ ]" "$C/password"
+brokerStart > /dev/null 2>&1
+sleep 1
+grep -o "opcua: server.security.trustList is empty[^-]*" "$OPCUA_TEST_DIR/broker.log" | head -1
+brokerStop
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+serverStop
+rm -rf "${OPCUA_TEST_DIR:?}/bridges.json" "$OPCUA_TEST_DIR/server.cmd" "$OPCUA_TEST_DIR/certs"
+
+--EXPECT--
+01. SignAndEncrypt, the server's certificate trusted, the right password - the level arrives
+============================================================================================
+ns=2;s=Tank1.Level available samplesIn=1 samplesOut=0
+
+
+02. The wrong password - dormant, and why
+=========================================
+ns=2;s=Tank1.Level dormant samplesIn=0 samplesOut=0 - the OPC UA server opc.tcp://localhost:PORT refused the connection (BadUserAccessDenied)
+
+
+03. A trust list without the server's certificate - dormant, and why
+====================================================================
+ns=2;s=Tank1.Level dormant samplesIn=0 samplesOut=0 - the OPC UA server opc.tcp://localhost:PORT refused the connection (BadCertificateUntrusted)
+
+
+04. Security None against a server without it - dormant, and why
+================================================================
+ns=2;s=Tank1.Level dormant samplesIn=0 samplesOut=0 - the OPC UA server opc.tcp://localhost:PORT refused the connection (BadIdentityTokenRejected)
+
+
+05. SignAndEncrypt, no trust list, no trustAny - the bridge refuses to start, and the broker says why
+====================================================================================================
+opcua: server.security.trustList is empty 
+
+

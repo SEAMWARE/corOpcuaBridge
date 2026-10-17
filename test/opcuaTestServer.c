@@ -6,7 +6,13 @@
 //
 // The OPC UA server the functional tests talk to - the bridge's peer, as mosquitto is the MQTT bridge's.
 //
-//   opcuaTestServer <port> <command fifo> <writes file>
+//   opcuaTestServer <port> <command fifo> <writes file> [<cert dir>]
+//   opcuaTestServer --makeCerts <cert dir>
+//
+// With a <cert dir> the server is SECURE: only the secure SecurityPolicies (None for discovery only), its
+// certificate server.der / server.key, trusting client.der alone, and no anonymous user - "operator" with
+// the password in <cert dir>/password. --makeCerts makes them: the server's and the client's certificates
+// and keys (DER), a third one no one trusts (other.der / other.key), and a random password.
 //
 // Its address space, namespace 2 ("urn:seamware:opcua-test" - namespace 1 is the server's own):
 //
@@ -42,6 +48,9 @@
 
 #include <open62541/server.h>
 #include <open62541/server_config_default.h>
+#include <open62541/plugin/accesscontrol_default.h>
+#include <open62541/plugin/create_certificate.h>
+#include <open62541/plugin/log_stdout.h>
 
 
 
@@ -404,11 +413,186 @@ static void command(UA_Server* server, char* line)
 
 
 
+// -----------------------------------------------------------------------------
+//
+// fileWrite / fileRead -
+//
+static int fileWrite(const char* dir, const char* name, const UA_ByteString* bsP)
+{
+  char path[1024];
+  snprintf(path, sizeof(path), "%s/%s", dir, name);
+
+  FILE* fP = fopen(path, "wb");
+
+  if (fP == NULL)
+    return -1;
+
+  int r = (fwrite(bsP->data, 1, bsP->length, fP) == bsP->length) ? 0 : -1;
+  fclose(fP);
+  return r;
+}
+
+static UA_ByteString fileRead(const char* dir, const char* name)
+{
+  char          path[1024];
+  UA_ByteString bs = UA_BYTESTRING_NULL;
+
+  snprintf(path, sizeof(path), "%s/%s", dir, name);
+
+  FILE* fP = fopen(path, "rb");
+
+  if (fP == NULL)
+    return bs;
+
+  fseek(fP, 0, SEEK_END);
+  long size = ftell(fP);
+  fseek(fP, 0, SEEK_SET);
+
+  bs.data = (UA_Byte*) UA_malloc(size + 1);
+
+  if ((bs.data != NULL) && (fread(bs.data, 1, size, fP) == (size_t) size))
+  {
+    bs.length     = size;
+    bs.data[size] = 0;
+  }
+
+  fclose(fP);
+  return bs;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// certMake - a self-signed certificate and its key, DER, as <name>.der / <name>.key
+//
+static int certMake(const char* dir, const char* name, const char* cn, const char* uri)
+{
+  char subjectCn[128];
+  char sanUri[256];
+
+  snprintf(subjectCn, sizeof(subjectCn), "CN=%s", cn);
+  snprintf(sanUri, sizeof(sanUri), "URI:%s", uri);
+
+  UA_String     subject[] = { UA_STRING_STATIC("C=DE"), UA_STRING_STATIC("O=SEAMWARE test"), UA_STRING(subjectCn) };
+  UA_String     san[]     = { UA_STRING_STATIC("DNS:localhost"), UA_STRING(sanUri) };
+  UA_ByteString key       = UA_BYTESTRING_NULL;
+  UA_ByteString cert      = UA_BYTESTRING_NULL;
+
+  UA_StatusCode sc = UA_CreateCertificate(UA_Log_Stdout, subject, 3, san, 2, UA_CERTIFICATEFORMAT_DER, NULL, &key, &cert);
+
+  if (sc != UA_STATUSCODE_GOOD)
+  {
+    fprintf(stderr, "opcuaTestServer: no certificate for %s (%s)\n", name, UA_StatusCode_name(sc));
+    return -1;
+  }
+
+  char file[64];
+  int  r = 0;
+
+  snprintf(file, sizeof(file), "%s.der", name);
+  r |= fileWrite(dir, file, &cert);
+  snprintf(file, sizeof(file), "%s.key", name);
+  r |= fileWrite(dir, file, &key);
+
+  UA_ByteString_clear(&cert);
+  UA_ByteString_clear(&key);
+  return r;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// certsMake - --makeCerts: the server's, the client's and a stranger's certificates, and a random password
+//
+static int certsMake(const char* dir)
+{
+  if ((certMake(dir, "server", "opcuaTestServer",          "urn:seamware:opcua-test-server") != 0) ||
+      (certMake(dir, "client", "coraine opcua bridge test", "urn:seamware:coraine:opcua-test") != 0) ||
+      (certMake(dir, "other",  "a server no one trusts",    "urn:seamware:opcua-test-server") != 0))
+    return 1;
+
+  unsigned char raw[12];
+  FILE*         fP = fopen("/dev/urandom", "rb");
+
+  if ((fP == NULL) || (fread(raw, 1, sizeof(raw), fP) != sizeof(raw)))
+    return 1;
+
+  fclose(fP);
+
+  char pw[sizeof(raw) * 2 + 2];
+
+  for (size_t ix = 0; ix < sizeof(raw); ix++)
+    snprintf(&pw[ix * 2], 3, "%02x", raw[ix]);
+
+  strcat(pw, "\n");
+
+  UA_ByteString bs = { strlen(pw), (UA_Byte*) pw };
+
+  return (fileWrite(dir, "password", &bs) == 0) ? 0 : 1;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// secureConfigure - <cert dir>: secure policies only, the client's certificate trusted, a user and password
+//
+static int secureConfigure(UA_Server* server, UA_UInt16 port, const char* dir)
+{
+  UA_ByteString cert  = fileRead(dir, "server.der");
+  UA_ByteString key   = fileRead(dir, "server.key");
+  UA_ByteString trust = fileRead(dir, "client.der");
+  UA_ByteString pw    = fileRead(dir, "password");
+
+  if ((cert.length == 0) || (key.length == 0) || (trust.length == 0) || (pw.length == 0))
+  {
+    fprintf(stderr, "opcuaTestServer: %s lacks server.der, server.key, client.der or password - opcuaTestServer --makeCerts %s\n", dir, dir);
+    return -1;
+  }
+
+  while ((pw.length > 0) && ((pw.data[pw.length - 1] == '\n') || (pw.data[pw.length - 1] == '\r')))
+    pw.length--;
+
+  UA_ServerConfig* config = UA_Server_getConfig(server);
+  UA_StatusCode    sc     = UA_ServerConfig_setDefaultWithSecureSecurityPolicies(config, port, &cert, &key, &trust, 1, NULL, 0, NULL, 0);
+
+  if (sc != UA_STATUSCODE_GOOD)
+  {
+    fprintf(stderr, "opcuaTestServer: no secure configuration (%s)\n", UA_StatusCode_name(sc));
+    return -1;
+  }
+
+  UA_String_clear(&config->applicationDescription.applicationUri);
+  config->applicationDescription.applicationUri = UA_STRING_ALLOC("urn:seamware:opcua-test-server");
+
+  UA_UsernamePasswordLogin login = { UA_STRING_STATIC("operator"), { pw.length, pw.data } };
+
+  if (config->accessControl.clear != NULL)
+    config->accessControl.clear(&config->accessControl);
+
+  sc = UA_AccessControl_default(config, false, NULL, 1, &login);
+
+  UA_ByteString_clear(&cert);
+  UA_ByteString_clear(&key);
+  UA_ByteString_clear(&trust);
+  UA_ByteString_clear(&pw);
+
+  return (sc == UA_STATUSCODE_GOOD) ? 0 : -1;
+}
+
+
+
 int main(int argc, char* argv[])
 {
-  if (argc != 4)
+  if ((argc == 3) && (strcmp(argv[1], "--makeCerts") == 0))
+    return certsMake(argv[2]);
+
+  if ((argc != 4) && (argc != 5))
   {
-    fprintf(stderr, "usage: opcuaTestServer <port> <command fifo> <writes file>\n");
+    fprintf(stderr, "usage: opcuaTestServer <port> <command fifo> <writes file> [<cert dir>]\n"
+                    "       opcuaTestServer --makeCerts <cert dir>\n");
     return 1;
   }
 
@@ -427,7 +611,13 @@ int main(int argc, char* argv[])
 
   UA_Server* server = UA_Server_new();
 
-  UA_ServerConfig_setMinimal(UA_Server_getConfig(server), (UA_UInt16) atoi(argv[1]), NULL);
+  if (argc == 5)
+  {
+    if (secureConfigure(server, (UA_UInt16) atoi(argv[1]), argv[4]) != 0)
+      return 1;
+  }
+  else
+    UA_ServerConfig_setMinimal(UA_Server_getConfig(server), (UA_UInt16) atoi(argv[1]), NULL);
   addressSpace(server);
   timestampsFix(server);
 

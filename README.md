@@ -35,6 +35,34 @@ it makes the Channels and AssetChannels; `server` is this plugin's.
 | `url` | the server, `opc.tcp://<host>:<port>` - mandatory |
 | `publishingIntervalMs` | the subscription's publishing interval (default 500) |
 | `samplingIntervalMs` | each monitored item's sampling interval (default 250) |
+| `security`, `user` | the SecureChannel and the user - below; none: SecurityPolicy None, anonymous |
+
+### Security
+
+```json
+"server": { "url": "opc.tcp://press-17.acme.example:4840",
+            "security": { "mode": "SignAndEncrypt", "policy": "Basic256Sha256",
+                          "certificate": "/etc/coraine/opcua/client.der", "privateKey": "/etc/coraine/opcua/client.key",
+                          "applicationUri": "urn:example:coraine",
+                          "trustList": [ "/etc/coraine/opcua/server.der" ] },
+            "user": { "username": "operator", "passwordFile": "/etc/coraine/opcua/password" } }
+```
+
+| `security` member | |
+|---|---|
+| `mode` | `None` (the default), `Sign`, `SignAndEncrypt` - the client connects with this mode only |
+| `policy` | `Basic256Sha256` (the default), `Aes128_Sha256_RsaOaep`, `Aes256_Sha256_RsaPss` - this policy only: no fallback to a weaker endpoint the server also offers |
+| `certificate`, `privateKey` | the client's, DER or PEM - mandatory for `Sign` and `SignAndEncrypt` |
+| `applicationUri` | the URI in the certificate's subjectAltName - mandatory with a certificate; a server refuses a client whose URI does not match |
+| `trustList` | the server certificates the client trusts (files). Empty: the bridge does not start |
+| `trustAny` | `true`: any server certificate is accepted, and the log says what that means - a server that pretends to be the one meant is not told apart |
+
+`user` - `username` and `password`, or `passwordFile` (the password is the file's first line: it stays out
+of the configuration file); none: anonymous. A password is never logged. With mode `None` the log warns
+that the password is protected only if the server's user token policy encrypts it.
+
+A refusal shows as each endpoint's `statusReason` - "the OPC UA server ... refused the connection
+(BadUserAccessDenied)", "(BadCertificateUntrusted)" - apart from a server that cannot be reached at all.
 
 An **endpoint** is a NodeId as OPC UA writes it (`ns=2;s=Press17`, `ns=1;i=1001`). What it carries is
 the node's class:
@@ -71,8 +99,8 @@ the node's class:
 
 ## Not yet
 
-- **Security**: the client connects anonymously, with SecurityPolicy None - no encryption, no user. For a
-  server on a trusted network only.
+- A user certificate (X.509 identity token), certificate and trust-list folders, a certificate the
+  bridge makes for itself.
 - Methods as services (coraine's Service Execution), writing to an AssetChannel's Variables, arrays and
   structured values on a Write, `channelInfo` keys (a different sampling interval per endpoint).
 
@@ -93,7 +121,8 @@ the coraine-dev package's source. `OPEN62541=<dir>` builds against open62541 unp
     make test
 
 Starts the tests' OPC UA server (`test/opcuaTestServer.c`: a press and a tank, its SourceTimestamps fixed,
-its values changed and its Writes recorded by the tests) on port 14840, and `coraine` (from `PATH`) on port
+its values changed and its Writes recorded by the tests; secure, with certificates and a password it makes
+for the run, for the security test) on port 14840, and `coraine` (from `PATH`) on port
 19026 with ramDB, loading `./opcua.so` by path, and runs `test/funcTests/cases/*.test` with corTest.
 `OPCUA_BROKER`, `OPCUA_PORT`, `OPCUA_SERVER`, `OPCUA_SERVER_PORT` and `OPCUA_TEST_DIR` override; the logs
 are in `/tmp/opcua-bridge-test/`.
