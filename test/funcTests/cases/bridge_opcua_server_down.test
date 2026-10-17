@@ -1,0 +1,60 @@
+#
+# FILE            bridge_opcua_server_down.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# The broker does not wait for the OPC UA server: it starts without it, and the Channels say why nothing
+# arrives - dormant, the server cannot be reached. The client keeps trying; once the server is up, the
+# Channels are available and the values arrive.
+#
+--NAME--
+opcua bridge - a server that is not up: the Channels dormant and why, available once it is
+
+--TAGS--
+bridge opcua
+
+--INIT--
+rm -rf "${OPCUA_TEST_DIR:?}"
+mkdir -p "$OPCUA_TEST_DIR"
+cat > $OPCUA_TEST_DIR/bridges.json <<J
+{ "opcua": { "server": { "url": "opc.tcp://localhost:$OPCUA_SERVER_PORT", "publishingIntervalMs": 100, "samplingIntervalMs": 50 },
+             "ngsild": { "defaultEntity": false, "topics": {
+               "ns=2;s=Tank1.Level": { "entityId": "urn:ngsi-ld:Tank:T1", "entityType": "Tank", "attribute": "level" } } } } }
+J
+brokerStart
+
+--RUN--
+echo "01. No server - the Channel is dormant: the server cannot be reached"
+echo "===================================================================="
+sleep 1
+channels
+echo
+echo
+
+
+echo "02. The server starts - the client connects, the Channel is available, the level arrives"
+echo "========================================================================================"
+serverStart
+entityAwait urn:ngsi-ld:Tank:T1 level '"level": 1.5' 15
+channels
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+serverStop
+rm -f "${OPCUA_TEST_DIR:?}/bridges.json" "$OPCUA_TEST_DIR/server.cmd"
+
+--EXPECT--
+01. No server - the Channel is dormant: the server cannot be reached
+====================================================================
+ns=2;s=Tank1.Level dormant samplesIn=0 samplesOut=0 - the OPC UA server opc.tcp://localhost:14840 cannot be reached (BadConnectionRejected)
+
+
+02. The server starts - the client connects, the Channel is available, the level arrives
+========================================================================================
+ns=2;s=Tank1.Level available samplesIn=1 samplesOut=0
+
+

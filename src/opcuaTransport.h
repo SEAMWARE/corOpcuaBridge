@@ -19,33 +19,38 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// The TRANSPORT - the part of the bridge that speaks the foreign protocol, and the part a real bridge
-// replaces. opcuaRegister.c is the seam to the broker and stays as it is; nothing in this interface
-// knows about the broker, entities or Channels: an endpoint, a JSON text and a time, both ways.
+// The TRANSPORT - OPC UA, as a client of one server (open62541). opcuaRegister.c is the seam to the broker;
+// nothing in this interface knows about the broker, entities or Channels: an endpoint, a JSON text and a
+// time, both ways.
 //
-// The example transport is a directory of files. An endpoint is a file path under the directory:
+// An endpoint is a NodeId, as OPC UA writes it ("ns=2;s=Press17", "ns=1;i=1001"), and what it carries is
+// decided by the node's class:
 //
-//   in   a file whose content changed becomes a sample - polled every pollMs
-//   out  a value published to an endpoint is written into its file
+//   a Variable  its value: in, each change the server reports (a monitored item), its SourceTimestamp the
+//               time; out, a value published is written to it (Write), converted to the node's DataType
+//   an Object   a model (a coraine AssetChannel): the node and what it contains, browsed, handed over as the
+//               neutral node tree { "model": <node> }, then { "values": [ ... ] } as its variables change
+//
+// One thread owns the client: it connects (and reconnects), browses, subscribes, reads and writes. The
+// broker's calls are queued to it - none of them waits on the server.
 //
 #include <stdbool.h>                                  // bool
 #include <stdint.h>                                   // int64_t
 
 #include "corTree/CorNode.h"                          // CorNode
-
 #include "corBridge/BridgeDriver.h"                   // BridgeDirection
 
 
 
 // -----------------------------------------------------------------------------
 //
-// OpcuaReceiveFunc - what the transport calls when a value arrives on an endpoint
+// OpcuaReceiveFunc - what the transport calls when a value or a model arrives on an endpoint
 //
-// Called on the TRANSPORT's own thread, never on a broker thread. json is the transport's: borrowed
-// for the duration of the call.
+// Called on the TRANSPORT's own thread, never on a broker thread. json is the transport's: borrowed for
+// the duration of the call.
 //
-// @param timeNs  when the value was produced, nanoseconds since the epoch, as the transport says -
-//                0 when it does not say
+// @param timeNs  when the value was produced, nanoseconds since the epoch (a Variable's SourceTimestamp) -
+//                0 for a model: its nodes carry their own times
 //
 typedef void (*OpcuaReceiveFunc)(const char* endpoint, const char* json, int64_t timeNs);
 
@@ -53,15 +58,31 @@ typedef void (*OpcuaReceiveFunc)(const char* endpoint, const char* json, int64_t
 
 // -----------------------------------------------------------------------------
 //
+// OpcuaStatusFunc - what the transport calls when an endpoint can or cannot be carried, and why
+//
+// From the transport's thread: the server cannot be reached (available false), is back (true), has no
+// such node (false).
+//
+typedef void (*OpcuaStatusFunc)(const char* endpoint, bool available, const char* reason);
+
+
+
+// -----------------------------------------------------------------------------
+//
 // opcuaTransportOpen - bring the transport up
 //
-// @param serverP    the "server" object of this bridge's member of the --bridgeConfig file, or NULL
-//                   when there is none. Read during the call and not kept.
-// @param receiveF   where arriving values go
+// Starts the client's thread, which connects without the broker waiting for it: a server that is not up
+// yet makes the endpoints dormant, with the reason, until it is.
 //
-// @return BRIDGE_OK or BRIDGE_ERR, the reason logged
+// @param serverP    the "server" object of this bridge's member of the --bridgeConfig file:
+//                   { "url": "opc.tcp://host:4840", "publishingIntervalMs": 500, "samplingIntervalMs": 250 }.
+//                   Read during the call and not kept.
+// @param receiveF   where arriving values and models go
+// @param statusF    where an endpoint's status goes
 //
-extern int opcuaTransportOpen(CorNode* serverP, OpcuaReceiveFunc receiveF);
+// @return BRIDGE_OK, or BRIDGE_ERR (no url) with the reason logged
+//
+extern int opcuaTransportOpen(CorNode* serverP, OpcuaReceiveFunc receiveF, OpcuaStatusFunc statusF);
 
 
 
@@ -75,14 +96,13 @@ extern void opcuaTransportClose(void);
 
 // -----------------------------------------------------------------------------
 //
-// opcuaTransportEndpointAdd - start carrying an endpoint
+// opcuaTransportEndpointAdd - start carrying an endpoint (queued to the client's thread)
 //
-// @param text  the endpoint carries plain text, not JSON: an arriving value becomes a JSON string
 // @param whyP  on a refusal, why - one line for a person, static text
 //
-// @return BRIDGE_OK, BRIDGE_BAD_INPUT (not an endpoint of this transport) or BRIDGE_ERR
+// @return BRIDGE_OK, BRIDGE_BAD_INPUT (not a NodeId) or BRIDGE_ERR
 //
-extern int opcuaTransportEndpointAdd(const char* endpoint, BridgeDirection direction, bool text, const char** whyP);
+extern int opcuaTransportEndpointAdd(const char* endpoint, BridgeDirection direction, const char** whyP);
 
 
 
@@ -96,13 +116,23 @@ extern int opcuaTransportEndpointDel(const char* endpoint);
 
 // -----------------------------------------------------------------------------
 //
-// opcuaTransportSend - send a value out on an endpoint
+// opcuaTransportSend - write a value to a Variable endpoint
 //
-// Called on a BROKER thread, inside the request that wrote the attribute: it must not block on
-// anything slow.
+// Called on a BROKER thread, inside the request that wrote the attribute: the value is converted to the
+// node's DataType here, and the Write queued to the client's thread.
 //
-// @return BRIDGE_OK, BRIDGE_NOT_FOUND (not an outbound endpoint) or BRIDGE_ERR
+// @return BRIDGE_OK (queued), BRIDGE_BAD_INPUT (the value does not fit the node's DataType, or the
+//         endpoint is no Variable), BRIDGE_ERR (the endpoint is not ready: not connected, not read yet),
+//         BRIDGE_NOT_FOUND (not an endpoint of this bridge)
 //
 extern int opcuaTransportSend(const char* endpoint, const char* json);
+
+
+
+// -----------------------------------------------------------------------------
+//
+// opcuaTransportVersion - "open62541 1.4.11"
+//
+extern const char* opcuaTransportVersion(void);
 
 #endif  // COROPCUABRIDGE_OPCUATRANSPORT_H_

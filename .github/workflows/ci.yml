@@ -18,16 +18,19 @@ jobs:
     runs-on: ubuntu-latest
 
     #
-    # Pinned, as in coraine's ci.yml: a red run is then a change in this repo, not in the image.
-    # TODO: move the tag with coraine's.
+    # Pinned, as in coraine's ci.yml (moved with it): a red run is then a change in this repo, not in the
+    # image. Ubuntu 26.04 - its libopen62541-1.4-dev is the library the bridge is built against.
     #
     container:
-      image: quay.io/seamware/coraine-ci:2026-09-22-f5a4eb4
+      image: quay.io/seamware/coraine-ci:2026-10-13-f4804c2
 
     env:
       SEAMWARE_PLUGIN_DIR: /opt/seamware/plugins
 
     steps:
+      - name: Install open62541
+        run: apt-get update -qq && apt-get install -y -qq libopen62541-1.4-dev
+
       - name: Check out this bridge
         uses: actions/checkout@v4
         with:
@@ -89,3 +92,4 @@ jobs:
             stack/bridge/test/funcTests/cases/*.diff
             stack/bridge/test/funcTests/cases/*.stderr
             /tmp/opcua-bridge-test/broker.log
+            /tmp/opcua-bridge-test/server.log

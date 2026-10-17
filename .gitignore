@@ -13,3 +13,4 @@ test/funcTests/cases/*.teardown
 test/funcTests/cases/*.name
 test/funcTests/cases/*.expect
 test/funcTests/cases/*.log
+test/opcuaTestServer

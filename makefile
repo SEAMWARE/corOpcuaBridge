@@ -51,9 +51,17 @@ endif
 # process at dlopen - a plugin is built against the headers of the broker it is loaded into. Only the
 # transport's own library is linked here.
 #
-# TODO: add your transport library - e.g. -lopen62541 for OPC UA
+# open62541 is the one library linked here - the distribution's: libopen62541-1.4-dev (Ubuntu 26.04,
+# Debian 13; Ubuntu 24.04 has no package, and no OPC UA bridge). OPEN62541=<dir> takes the headers and the
+# library from <dir>/usr/include and <dir>/usr/lib/x86_64-linux-gnu instead (a package unpacked there).
 #
-LIBS          = -lpthread
+OPEN62541    ?=
+ifneq ($(OPEN62541),)
+INCLUDE      += -I$(OPEN62541)/usr/include
+O62541_LIB    = -L$(OPEN62541)/usr/lib/x86_64-linux-gnu -Wl,-rpath,$(abspath $(OPEN62541))/usr/lib/x86_64-linux-gnu
+endif
+
+LIBS          = $(O62541_LIB) -lopen62541 -lpthread
 
 SOURCES       = src/opcuaRegister.c src/opcuaTransport.c
 OBJS          = $(SOURCES:.c=.o)
@@ -90,6 +98,16 @@ $(COR_LIBS)/corBridge/BridgeDriver.h:
 	  exit 1; \
 	fi
 
+#
+# server - the tests' OPC UA server (test/opcuaTestServer.c): a press, a tank, values to change and to write
+#
+TEST_SERVER   = test/opcuaTestServer
+
+server: $(TEST_SERVER)
+
+$(TEST_SERVER): test/opcuaTestServer.c .flags
+	$(CC) -std=gnu11 -O2 -Wall -Werror $(INCLUDE) $< -o $@ $(LIBS)
+
 install: all
 	mkdir -p $(PLUGIN_DIR)
 	cp -p $(PLUGIN) $(PLUGIN_DIR)/
@@ -118,12 +136,12 @@ CORTEST      ?= $(shell command -v corTest || echo $(COR_LIBS)/corTest/corTest)
 # for coraine's own suite - here it would take down every broker on the host. These tests stop their
 # own broker by pid.
 #
-test: all
+test: all server
 	COR_TEST_NO_REAP=on $(CORTEST) --noColor
 
 clean:
-	rm -f src/*.o src/*.d *.so *~ .flags
+	rm -f src/*.o src/*.d *.so *~ .flags $(TEST_SERVER)
 
 -include $(DEPS)
 
-.PHONY: all install di ci clean contract test FORCE
+.PHONY: all install di ci clean contract test server FORCE
