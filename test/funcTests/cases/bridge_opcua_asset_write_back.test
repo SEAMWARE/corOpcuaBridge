@@ -1,0 +1,184 @@
+#
+# FILE            bridge_opcua_asset_write_back.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# AssetChannel write-back (coraine's doc/asset-channels.md, channelDirection both): a client's write to an
+# attribute made from a Variable of the model goes to that Variable first - a Write, the value converted to
+# its DataType - and is stored only when the bridge takes it:
+#
+#   hydraulicsPressure  P17.Pressure, a writable Double - written, then stored
+#   mode                P17.Mode, a writable String - written, then stored
+#   hydraulicsOilTemp   P17.OilTemp, read-only at the server - 422, nothing stored
+#   hydraulicsPressure  "high" does not fit a Double - 400, nothing stored
+#   unit1               a Relationship, made of no one node - 422
+#
+# The server's own changes still come in; the echo of a write is no sample of its own.
+#
+# REQUIRE_FEATURE: ASSET_CHANNELS
+# REQUIRE_FEATURE: CHANNEL_WRITE_BACK
+#
+--NAME--
+opcua bridge - AssetChannel write-back: a client's write to a model's Variable, written to the server first
+
+--TAGS--
+bridge opcua
+
+--INIT--
+rm -rf "${OPCUA_TEST_DIR:?}"
+mkdir -p "$OPCUA_TEST_DIR"
+cat > $OPCUA_TEST_DIR/bridges.json <<J
+{ "opcua": { "server": { "url": "opc.tcp://localhost:$OPCUA_SERVER_PORT", "publishingIntervalMs": 100, "samplingIntervalMs": 50 },
+             "ngsild": { "defaultEntity": false, "assetChannels": {
+               "ns=2;s=Press17": { "entities": "natural", "channelDirection": "both" } } } } }
+J
+serverStart
+brokerStart
+
+--RUN--
+P=urn:ngsi-ld:PressType:Press17
+entityAwait $P mode '"mode": "auto"'
+
+echo "01. PATCH hydraulicsPressure 220 - written to P17.Pressure, then stored"
+echo "======================================================================="
+attrPatch $P hydraulicsPressure '{"value": 220}'
+deviceAwaitWrite "ns=2;s=P17.Pressure" 220
+entityGet $P hydraulicsPressure keyValues
+echo
+echo
+
+
+echo "02. PATCH mode \"manual\" - a String, written to P17.Mode, then stored"
+echo "====================================================================="
+attrPatch $P mode '{"value": "manual"}'
+deviceAwaitWrite "ns=2;s=P17.Mode" '"manual"'
+entityGet $P mode keyValues
+echo
+echo
+
+
+echo "03. PATCH hydraulicsOilTemp - read-only at the server: 422, the value stays 48.1"
+echo "================================================================================"
+attrPatch $P hydraulicsOilTemp '{"value": 50}'
+entityGet $P hydraulicsOilTemp keyValues
+echo
+echo
+
+
+echo "04. PATCH hydraulicsPressure \"high\" - not a Double: 400, the value stays 220"
+echo "============================================================================="
+attrPatch $P hydraulicsPressure '{"value": "high"}'
+entityGet $P hydraulicsPressure keyValues
+echo
+echo
+
+
+echo "05. PATCH unit1 - a Relationship, made of no one node: 422"
+echo "=========================================================="
+attrPatch $P unit1 '{"object": "urn:ngsi-ld:HydraulicUnitType:Other"}'
+entityGet $P unit1 keyValues
+echo
+echo
+
+
+echo "06. The server's own change still comes in - the pressure 230 at 10:00:05"
+echo "========================================================================="
+deviceSet "ns=2;s=P17.Pressure" 230 2026-10-17T10:00:05Z
+entityAwait $P hydraulicsPressure '"hydraulicsPressure": 230'
+entityGet $P hydraulicsPressure
+echo
+echo
+
+
+echo "07. GET /assetChannels - both, two values out; the writes' echoes no values in (one: step 06)"
+echo "============================================================================================="
+curl -s "localhost:$OPCUA_PORT/ngsi-ld/v1/assetChannels" | python3 -c 'import sys, json
+c = json.load(sys.stdin)[0]
+print(c["channelTarget"], c["status"], c.get("channelDirection"), "valuesOut=%s valuesIn=%s" % (c.get("valuesOut"), c.get("valuesIn")))'
+echo "The server's writes:"
+deviceWrites
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+serverStop
+rm -f "${OPCUA_TEST_DIR:?}/bridges.json" "$OPCUA_TEST_DIR/server.cmd"
+
+--EXPECT--
+01. PATCH hydraulicsPressure 220 - written to P17.Pressure, then stored
+=======================================================================
+204
+ns=2;s=P17.Pressure 220
+{
+  "hydraulicsPressure": 220,
+  "id": "urn:ngsi-ld:PressType:Press17",
+  "type": "PressType"
+}
+
+
+02. PATCH mode "manual" - a String, written to P17.Mode, then stored
+=====================================================================
+204
+ns=2;s=P17.Mode "manual"
+{
+  "id": "urn:ngsi-ld:PressType:Press17",
+  "mode": "manual",
+  "type": "PressType"
+}
+
+
+03. PATCH hydraulicsOilTemp - read-only at the server: 422, the value stays 48.1
+================================================================================
+422
+{
+  "hydraulicsOilTemp": 48.1,
+  "id": "urn:ngsi-ld:PressType:Press17",
+  "type": "PressType"
+}
+
+
+04. PATCH hydraulicsPressure "high" - not a Double: 400, the value stays 220
+=============================================================================
+400
+{
+  "hydraulicsPressure": 220,
+  "id": "urn:ngsi-ld:PressType:Press17",
+  "type": "PressType"
+}
+
+
+05. PATCH unit1 - a Relationship, made of no one node: 422
+==========================================================
+422
+{
+  "id": "urn:ngsi-ld:PressType:Press17",
+  "type": "PressType",
+  "unit1": "urn:ngsi-ld:HydraulicUnitType:Press17:Unit1"
+}
+
+
+06. The server's own change still comes in - the pressure 230 at 10:00:05
+=========================================================================
+{
+  "hydraulicsPressure": {
+    "observedAt": "2026-10-17T10:00:05Z",
+    "type": "Property",
+    "unitCode": "BAR",
+    "value": 230
+  },
+  "id": "urn:ngsi-ld:PressType:Press17",
+  "type": "PressType"
+}
+
+
+07. GET /assetChannels - both, two values out; the writes' echoes no values in (one: step 06)
+=============================================================================================
+ns=2;s=Press17 available both valuesOut=2 valuesIn=1
+The server's writes:
+ns=2;s=P17.Pressure 220
+ns=2;s=P17.Mode "manual"
+
+

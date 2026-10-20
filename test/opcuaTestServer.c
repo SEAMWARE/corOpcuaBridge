@@ -24,6 +24,9 @@
 //     Unit1                  ns=2;s=P17.Unit1, a HydraulicUnitType - HasEffect -> Press17
 //       Running              ns=2;s=P17.Unit1.Running, Boolean true
 //     Start                  ns=2;s=P17.Start, a method
+//     SetSpeed               ns=2;s=P17.SetSpeed, a method: in speed (Double), ramp (Boolean); out previous (Double)
+//     Stop                   ns=2;s=P17.Stop, a method that fails: BadInvalidState
+//     Log                    ns=2;s=P17.Log, a method: in lines (String[]); out count (UInt32)
 //   Objects/Tank1            ns=2;s=Tank1
 //     Level                  ns=2;s=Tank1.Level, Double 1.5
 //     Setpoint               ns=2;s=Tank1.Setpoint, Double 0, writable
@@ -37,7 +40,8 @@
 //
 //   set <node id> <ISO 8601 time> <JSON value>        set ns=2;s=P17.Pressure 2026-10-17T10:00:05Z 214
 //
-// Every Write a client makes is appended to the writes file: "<node id> <JSON value>".
+// Every Write a client makes is appended to the writes file: "<node id> <JSON value>"; every Call of
+// SetSpeed or Log: "call <method node id> <its input arguments>".
 //
 #include <fcntl.h>                                    // open, O_RDWR, O_NONBLOCK
 #include <signal.h>                                   // signal, SIGTERM, SIGINT
@@ -113,6 +117,29 @@ static void written(UA_Server* server, const UA_NodeId* sessionId, void* session
   if (fP != NULL)
   {
     fprintf(fP, "%.*s %s\n", (int) id.length, (char*) id.data, value);
+    fclose(fP);
+  }
+
+  UA_String_clear(&id);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// callRecord - a method called: the writes file says so
+//
+static void callRecord(const UA_NodeId* methodId, const char* args)
+{
+  UA_String id = UA_STRING_NULL;
+
+  UA_NodeId_print(methodId, &id);
+
+  FILE* fP = fopen(writesPath, "a");
+
+  if (fP != NULL)
+  {
+    fprintf(fP, "call %.*s %s\n", (int) id.length, (char*) id.data, args);
     fclose(fP);
   }
 
@@ -206,6 +233,100 @@ static UA_StatusCode startCalled(UA_Server* server, const UA_NodeId* sessionId, 
 
 
 
+static UA_Double speed = 0;
+
+static UA_StatusCode setSpeedCalled(UA_Server* server, const UA_NodeId* sessionId, void* sessionHandle, const UA_NodeId* methodId,
+                                    void* methodContext, const UA_NodeId* objectId, void* objectContext, size_t inputSize,
+                                    const UA_Variant* input, size_t outputSize, UA_Variant* output)
+{
+  (void) server; (void) sessionId; (void) sessionHandle; (void) methodContext; (void) objectId; (void) objectContext;
+
+  if ((inputSize != 2) || (outputSize != 1))
+    return UA_STATUSCODE_BADARGUMENTSMISSING;
+
+  char args[512];
+  char a[256];
+  char b[256];
+
+  valueText(&input[0], a, sizeof(a));
+  valueText(&input[1], b, sizeof(b));
+  snprintf(args, sizeof(args), "%s %s", a, b);
+  callRecord(methodId, args);
+
+  UA_Double previous = speed;
+
+  speed = *(UA_Double*) input[0].data;
+  return UA_Variant_setScalarCopy(&output[0], &previous, &UA_TYPES[UA_TYPES_DOUBLE]);
+}
+
+static UA_StatusCode stopCalled(UA_Server* server, const UA_NodeId* sessionId, void* sessionHandle, const UA_NodeId* methodId,
+                                void* methodContext, const UA_NodeId* objectId, void* objectContext, size_t inputSize,
+                                const UA_Variant* input, size_t outputSize, UA_Variant* output)
+{
+  (void) server; (void) sessionId; (void) sessionHandle; (void) methodId; (void) methodContext;
+  (void) objectId; (void) objectContext; (void) inputSize; (void) input; (void) outputSize; (void) output;
+  return UA_STATUSCODE_BADINVALIDSTATE;
+}
+
+static UA_StatusCode logCalled(UA_Server* server, const UA_NodeId* sessionId, void* sessionHandle, const UA_NodeId* methodId,
+                               void* methodContext, const UA_NodeId* objectId, void* objectContext, size_t inputSize,
+                               const UA_Variant* input, size_t outputSize, UA_Variant* output)
+{
+  (void) server; (void) sessionId; (void) sessionHandle; (void) methodContext; (void) objectId; (void) objectContext;
+
+  if ((inputSize != 1) || (outputSize != 1) || (input[0].type != &UA_TYPES[UA_TYPES_STRING]))
+    return UA_STATUSCODE_BADARGUMENTSMISSING;
+
+  char   args[512] = "";
+  size_t len       = 0;
+
+  for (size_t ix = 0; ix < input[0].arrayLength; ix++)
+  {
+    UA_String* sP = &((UA_String*) input[0].data)[ix];
+
+    len += snprintf(&args[len], sizeof(args) - len, "%s\"%.*s\"", (ix == 0) ? "" : ",", (int) sP->length, (char*) sP->data);
+
+    if (len >= sizeof(args))
+      break;
+  }
+
+  callRecord(methodId, args);
+
+  UA_UInt32 count = (UA_UInt32) input[0].arrayLength;
+
+  return UA_Variant_setScalarCopy(&output[0], &count, &UA_TYPES[UA_TYPES_UINT32]);
+}
+
+
+
+//
+// argument - a method's argument: a name, a type, scalar (-1) or an array (1)
+//
+static UA_Argument argument(const char* name, const UA_DataType* typeP, UA_Int32 valueRank)
+{
+  UA_Argument a;
+
+  UA_Argument_init(&a);
+  a.name      = UA_STRING((char*) name);
+  a.dataType  = typeP->typeId;
+  a.valueRank = valueRank;
+
+  return a;
+}
+
+static void methodAdd(UA_Server* server, const char* id, const char* name, UA_MethodCallback callback,
+                      size_t inSize, const UA_Argument* in, size_t outSize, const UA_Argument* out)
+{
+  UA_MethodAttributes mattr = UA_MethodAttributes_default;
+  mattr.displayName    = UA_LOCALIZEDTEXT("", (char*) name);
+  mattr.executable     = true;
+  mattr.userExecutable = true;
+  UA_Server_addMethodNode(server, UA_NODEID_STRING(ns, (char*) id), UA_NODEID_STRING(ns, "Press17"), UA_NODEID_NUMERIC(0, UA_NS0ID_HASCOMPONENT),
+                          UA_QUALIFIEDNAME(ns, (char*) name), mattr, callback, inSize, in, outSize, out, NULL, NULL);
+}
+
+
+
 // -----------------------------------------------------------------------------
 //
 // addressSpace - the press and the tank
@@ -255,6 +376,15 @@ static void addressSpace(UA_Server* server)
   mattr.userExecutable = true;
   UA_Server_addMethodNode(server, UA_NODEID_STRING(ns, "P17.Start"), UA_NODEID_STRING(ns, "Press17"), component,
                           UA_QUALIFIEDNAME(ns, "Start"), mattr, startCalled, 0, NULL, 0, NULL, NULL, NULL);
+
+  UA_Argument speedIn[2]  = { argument("speed", &UA_TYPES[UA_TYPES_DOUBLE], -1), argument("ramp", &UA_TYPES[UA_TYPES_BOOLEAN], -1) };
+  UA_Argument speedOut[1] = { argument("previous", &UA_TYPES[UA_TYPES_DOUBLE], -1) };
+  UA_Argument logIn[1]    = { argument("lines", &UA_TYPES[UA_TYPES_STRING], 1) };
+  UA_Argument logOut[1]   = { argument("count", &UA_TYPES[UA_TYPES_UINT32], -1) };
+
+  methodAdd(server, "P17.SetSpeed", "SetSpeed", setSpeedCalled, 2, speedIn, 1, speedOut);
+  methodAdd(server, "P17.Stop",     "Stop",     stopCalled,     0, NULL,    0, NULL);
+  methodAdd(server, "P17.Log",      "Log",      logCalled,      1, logIn,   1, logOut);
 
   objectAdd(server, objects, organizes, "Tank1", "Tank1", UA_NODEID_NUMERIC(0, UA_NS0ID_BASEOBJECTTYPE));
 

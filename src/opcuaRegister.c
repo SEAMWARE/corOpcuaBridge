@@ -45,6 +45,9 @@
 #include "corJson/corJsonParse.h"                     // corJsonParse
 #include "corTree/CorNode.h"                          // CorNode
 #include "corTree/corTreeLookup.h"                    // corTreeLookup
+#include "corTree/corTreeBuilder.h"                   // corTreeObject, corTreeString, corTreeInteger, corTreeChildAdd
+#include "corJson/corJsonRender.h"                    // corJsonFastRender
+#include "corJson/corJsonRenderSize.h"                // corJsonFastRenderSize
 
 #include "corBridge/BridgeDriver.h"                   // BridgeDriver, BridgeChannelKind, BridgeDirection
 #include "corBridge/BridgeBroker.h"                   // BridgeBroker, BRIDGE_*
@@ -105,6 +108,79 @@ static void opcuaStatus(const char* endpoint, bool available, const char* reason
   (void) reason;
 #endif
 }
+
+
+
+#if BRIDGE_ABI_VERSION >= 11
+// -----------------------------------------------------------------------------
+//
+// opcuaCallEnded - a method's Call has ended: the Service Execution completed (the output arguments by name)
+// or failed (why, in a ProblemDetails). On the transport's thread
+//
+static void opcuaCallEnded(const char* executionId, bool ok, const char* outputJson, const char* why)
+{
+  if ((brokerP == NULL) || (brokerP->abiVersion < 11) || (brokerP->serviceUpdateIn == NULL))
+    return;
+
+  int r;
+
+  if (ok == true)
+    r = brokerP->serviceUpdateIn("opcua", executionId, "completed", NULL, outputJson, NULL);
+  else
+  {
+    CorAlloc ka;
+    char     kaBuf[4096];
+    char     pd[2048];
+
+    corAllocBufferInit(&ka, kaBuf, sizeof(kaBuf), 4096, NULL, "opcua problem");
+
+    CorNode* pdP = corTreeObject(&ka, NULL);
+
+    corTreeChildAdd(pdP, corTreeString(&ka, "type",   "https://uri.etsi.org/ngsi-ld/errors/InternalError"));
+    corTreeChildAdd(pdP, corTreeString(&ka, "title",  "The OPC UA method call failed"));
+    corTreeChildAdd(pdP, corTreeInteger(&ka, "status", 502));
+    corTreeChildAdd(pdP, corTreeString(&ka, "detail", (char*) why));
+
+    bool fits = (corJsonFastRenderSize(pdP) < (int) sizeof(pd));
+
+    if (fits == true)
+      corJsonFastRender(pdP, pd);
+
+    r = brokerP->serviceUpdateIn("opcua", executionId, "failed", NULL, NULL, (fits == true) ? pd : NULL);
+    corAllocBufferReset(&ka, false);
+  }
+
+  if ((r != BRIDGE_OK) && (r != BRIDGE_NOT_FOUND))
+    COR_W("opcua: the broker did not take the end of execution '%s' (%d)", executionId, r);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// opcuaServiceExecute - BridgeDriver.serviceExecute, ABI 11: a Service Registration's endpoint
+// opcua://<object NodeId>/<method NodeId> - the method called on the object, the execution input its
+// input arguments by name. On a broker thread: queued, the outcome reported later (opcuaCallEnded)
+//
+static int opcuaServiceExecute(const char* url, const char* executionId, const char* inputJson)
+{
+  return opcuaTransportCall(url, executionId, inputJson);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// opcuaServiceCancel - BridgeDriver.serviceCancel, ABI 11: an OPC UA Call cannot be taken back
+//
+static int opcuaServiceCancel(const char* url, const char* executionId)
+{
+  (void) url;
+  (void) executionId;
+
+  return BRIDGE_UNSUPPORTED;
+}
+#endif
 
 
 
@@ -178,6 +254,10 @@ static int opcuaInit(const char* configFile, const BridgeBroker* _brokerP)
   // the client connects on its own thread: a server that is not up yet makes the endpoints dormant, it
   // does not hold the broker's startup
   //
+#if BRIDGE_ABI_VERSION >= 11
+  opcuaTransportCallFunc(opcuaCallEnded);
+#endif
+
   int r = opcuaTransportOpen(serverP, opcuaReceive, opcuaStatus);
 
   corAllocBufferReset(&ka, false);                    // nothing parsed here is kept
@@ -355,8 +435,7 @@ static const char* opcuaVersionInfo(void)
 //
 // Not filled here, all optional: args (command-line options of the plugin's own), the service and
 // action entry points (ABI 2-4), notifySchemes + notify (ABI 10, notifications to a URI scheme of the
-// transport - corMqttBridge), serviceSchemes + serviceExecute + serviceCancel (ABI 11, Service
-// Execution). See BridgeDriver.h.
+// transport - corMqttBridge). See BridgeDriver.h.
 //
 __attribute__((visibility("default"))) void bridgeRegister(BridgeDriver* driverP)
 {
@@ -375,6 +454,15 @@ __attribute__((visibility("default"))) void bridgeRegister(BridgeDriver* driverP
 
   if (driverP->abiVersion >= 9)
     driverP->channelAddInfo = opcuaChannelAddInfo;
+
+#if BRIDGE_ABI_VERSION >= 11
+  if (driverP->abiVersion >= 11)
+  {
+    driverP->serviceSchemes = "opcua";                // opcua://<object NodeId>/<method NodeId> - a method, called
+    driverP->serviceExecute = opcuaServiceExecute;
+    driverP->serviceCancel  = opcuaServiceCancel;
+  }
+#endif
 
 #if BRIDGE_ABI_VERSION >= 14
   if (driverP->abiVersion >= 14)
