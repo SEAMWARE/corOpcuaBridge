@@ -83,6 +83,32 @@ the node's class:
   targets as its `semanticIds` (a string NodeId - an IRDI, a URI - as the string); its other forward
   references as `references`. Then every Variable of the model is monitored, and each change handed over as
   `{ "values": [ ... ] }`. Which nodes become entities, and how, is the broker's mapping.
+  With `"channelDirection": "both"` (coraine's AssetChannel write-back) a client's write to an attribute
+  made from one of the model's Variables is a Write to that Variable, converted to its DataType - read
+  with the model, with its AccessLevel: a value that does not fit is refused (400), a Variable the server
+  does not let be written answers 422, nothing stored either way.
+
+A **method** is a service (coraine's [Service Execution](https://github.com/SEAMWARE/coraine/blob/main/doc/service-execution.md),
+bridge ABI 11): a Service Registration whose endpoint is `opcua://<object NodeId>/<method NodeId>` is
+executed by the bridge - the method called on the object (an OPC UA Call):
+
+```json
+{ "type": "ServiceRegistration", "endpoint": "opcua://ns=2;s=Press17/ns=2;s=P17.SetSpeed",
+  "entities": [ { "id": "urn:ngsi-ld:PressType:Press17", "type": "PressType" } ],
+  "serviceInformation": { "serviceName": "setSpeed" } }
+```
+
+- **The input** is an object, a member per input argument by its name (the method's `InputArguments`),
+  each converted to the argument's DataType - a scalar, or an array for an argument of valueRank 1 or more:
+  `{ "speed": 12.5, "ramp": true }`. A missing argument, a member that is no argument, a value that does
+  not fit: the execution fails before anything is called. `id` and `type` are the entity's.
+- **The output** is an object, each output argument by its name (`OutputArguments`): `{ "previous": 0 }`;
+  a method without output arguments has none.
+- **A failure** - the method's StatusCode (`BadInvalidState`), a method the server does not have
+  (`BadMethodInvalid`), a server that cannot be reached - fails the execution, the ProblemDetails saying
+  why (a synchronous service answers 502). A '/' inside a NodeId is written `%2F`.
+- A Call cannot be cancelled. One asked for while the server cannot be reached fails at once - it is not
+  run once the server is back.
 
 `channelInfo` takes no keys yet: one is refused, and the Channel is dormant.
 
@@ -105,8 +131,9 @@ the node's class:
 
 - A user certificate (X.509 identity token), certificate and trust-list folders, a certificate the
   bridge makes for itself.
-- Methods as services (coraine's Service Execution), writing to an AssetChannel's Variables, arrays and
-  structured values on a Write, `channelInfo` keys (a different sampling interval per endpoint).
+- Registering a model's methods as services by itself (a Service Registration is made by hand), arrays
+  and structured values on a Write, structured method arguments, `channelInfo` keys (a different sampling
+  interval per endpoint).
 
 ## Building
 

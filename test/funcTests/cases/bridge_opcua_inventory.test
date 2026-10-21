@@ -119,6 +119,21 @@ rm -f "${OPCUA_TEST_DIR:?}/bridges.json" "$OPCUA_TEST_DIR/server.cmd"
       "node": "method",
       "id": "ns=2;s=P17.Start",
       "name": "Start"
+    },
+    {
+      "node": "method",
+      "id": "ns=2;s=P17.SetSpeed",
+      "name": "SetSpeed"
+    },
+    {
+      "node": "method",
+      "id": "ns=2;s=P17.Stop",
+      "name": "Stop"
+    },
+    {
+      "node": "method",
+      "id": "ns=2;s=P17.Log",
+      "name": "Log"
     }
   ]
 }
@@ -212,6 +227,21 @@ rm -f "${OPCUA_TEST_DIR:?}/bridges.json" "$OPCUA_TEST_DIR/server.cmd"
       "node": "method",
       "id": "ns=2;s=P17.Start",
       "name": "Start"
+    },
+    {
+      "node": "method",
+      "id": "ns=2;s=P17.SetSpeed",
+      "name": "SetSpeed"
+    },
+    {
+      "node": "method",
+      "id": "ns=2;s=P17.Stop",
+      "name": "Stop"
+    },
+    {
+      "node": "method",
+      "id": "ns=2;s=P17.Log",
+      "name": "Log"
     }
   ]
 }

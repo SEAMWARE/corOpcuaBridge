@@ -34,10 +34,19 @@
 #include <open62541/client.h>
 #include <open62541/client_config_default.h>
 #include <open62541/client_highlevel.h>
+#include <open62541/client_highlevel_async.h>
 #include <open62541/client_subscriptions.h>
 #include <open62541/plugin/log.h>
 
 #include "corLog/corLog.h"                            // COR_E, COR_W, COR_V, COR_T
+#include "corAlloc/CorAlloc.h"                        // CorAlloc
+#include "corAlloc/corAllocBufferInit.h"              // corAllocBufferInit
+#include "corAlloc/corAllocBufferReset.h"             // corAllocBufferReset
+#include "corJson/CorJson.h"                          // CorJson
+#include "corJson/corJsonCreate.h"                    // corJsonCreate
+#include "corJson/corJsonParse.h"                     // corJsonParse
+#include "corJson/corJsonRender.h"                    // corJsonFastRender
+#include "corJson/corJsonRenderSize.h"                // corJsonFastRenderSize
 #include "corTree/CorNode.h"                          // CorNode
 #include "corTree/corTreeLookup.h"                    // corTreeLookup
 #include "corBridge/BridgeBroker.h"                   // BRIDGE_*
@@ -307,8 +316,27 @@ typedef struct Endpoint
   const UA_DataType*  dataType;                       // a Variable's: what a published value is converted to
   char*               lastWritten;                    // the JSON of the last value written: its echo is not a sample
   bool                refused;                        // the server has no such node, or it is no Variable/Object
+  BridgeDirection     direction;                      // a model's: Both - its Variables are written to (write-back)
   struct Endpoint*    next;
 } Endpoint;
+
+
+
+// -----------------------------------------------------------------------------
+//
+// ModelVar - a Variable of a model whose AssetChannel writes back: what a value published on it is converted
+// to. Made by the client's thread as the model is browsed, looked up by a broker thread - under mutex
+//
+typedef struct ModelVar
+{
+  char*               nodeId;                         // as text - what the broker publishes on
+  UA_NodeId           id;
+  char*               endpoint;                       // the model's root
+  const UA_DataType*  dataType;                       // NULL: not a type a value converts to
+  bool                writable;                       // its AccessLevel has CurrentWrite
+  char*               lastWritten;                    // the JSON of the last value written: its echo is not a sample
+  struct ModelVar*    next;
+} ModelVar;
 
 
 
@@ -336,7 +364,8 @@ typedef enum OpType
   OpAdd       = 0,
   OpDel       = 1,
   OpWrite     = 2,
-  OpInventory = 3
+  OpInventory = 3,
+  OpCall      = 4
 } OpType;
 
 //
@@ -360,6 +389,9 @@ typedef struct Op
   OpType      type;
   char*       endpoint;
   InventoryReq* invP;                                 // OpInventory
+  char*       executionId;                            // OpCall - endpoint the object, json the input
+  UA_NodeId   objectId;                               // OpCall
+  UA_NodeId   methodId;                               // OpCall
   UA_Variant  value;                                  // OpWrite
   char*       json;                                   // OpWrite: what the broker sent - for the echo
   struct Op*  next;
@@ -376,6 +408,7 @@ static double            publishingIntervalMs = 500;
 static double            samplingIntervalMs   = 250;
 static OpcuaReceiveFunc  receiveFunc          = NULL;
 static OpcuaStatusFunc   statusFunc           = NULL;
+static OpcuaCallFunc     callFunc             = NULL;
 
 static pthread_t         clientThreadId;
 static bool              clientThreadRunning  = false;
@@ -383,6 +416,7 @@ static volatile bool     stopping             = false;
 
 static pthread_mutex_t   mutex                = PTHREAD_MUTEX_INITIALIZER;   // endpoints and ops
 static Endpoint*         endpoints            = NULL;
+static ModelVar*         modelVars            = NULL;
 static Op*               opsHead              = NULL;
 static Op*               opsTail              = NULL;
 
@@ -434,6 +468,53 @@ static Endpoint* endpointFind(const char* name)
   }
 
   return NULL;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// modelVarFind - under mutex
+//
+static ModelVar* modelVarFind(const char* nodeId)
+{
+  for (ModelVar* mvP = modelVars; mvP != NULL; mvP = mvP->next)
+  {
+    if (strcmp(mvP->nodeId, nodeId) == 0)
+      return mvP;
+  }
+
+  return NULL;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// modelVarsDrop - the Variables of a model (NULL: of every model) - under mutex
+//
+static void modelVarsDrop(const char* endpoint)
+{
+  ModelVar** prevPP = &modelVars;
+
+  while (*prevPP != NULL)
+  {
+    ModelVar* mvP = *prevPP;
+
+    if ((endpoint != NULL) && (strcmp(mvP->endpoint, endpoint) != 0))
+    {
+      prevPP = &mvP->next;
+      continue;
+    }
+
+    *prevPP = mvP->next;
+
+    free(mvP->nodeId);
+    free(mvP->endpoint);
+    free(mvP->lastWritten);
+    UA_NodeId_clear(&mvP->id);
+    free(mvP);
+  }
 }
 
 
@@ -499,6 +580,9 @@ static void opFree(Op* opP)
 {
   free(opP->endpoint);
   free(opP->json);
+  free(opP->executionId);
+  UA_NodeId_clear(&opP->objectId);
+  UA_NodeId_clear(&opP->methodId);
   UA_Variant_clear(&opP->value);
   free(opP);
 }
@@ -552,6 +636,30 @@ static void dataChange(UA_Client* clientP, UA_UInt32 subId, void* subContext, UA
   {
     if (first == true)
       return;                                         // the value the model was read with
+
+    //
+    // The echo of a write-back: the server reports the value the bridge just wrote - not a sample
+    //
+    Buf v = { NULL, 0, 0, false };
+
+    variantJson(&v, &valueP->value);
+
+    pthread_mutex_lock(&mutex);
+
+    ModelVar* mvP  = modelVarFind(icP->nodeId);
+    bool      echo = (mvP != NULL) && (mvP->lastWritten != NULL) && (v.s != NULL) && (strcmp(mvP->lastWritten, v.s) == 0);
+
+    if (echo == true)
+    {
+      free(mvP->lastWritten);
+      mvP->lastWritten = NULL;
+    }
+
+    pthread_mutex_unlock(&mutex);
+    free(v.s);
+
+    if (echo == true)
+      return;
 
     char iso[64] = "";
 
@@ -855,10 +963,13 @@ typedef struct Walk
   int          visited;
   int          visitedMax;
   UA_NodeId*   variableV;                             // the Variables of the model - monitored once it is handed over
+  const UA_DataType** typeV;                          // writeBack: each one's DataType (NULL: not one a value converts to)
+  bool*        writableV;                             // writeBack: and whether it may be written
   int          variables;
   int          variablesMax;
   int          nodes;
   bool         inventory;                             // for a mapping tool: a Variable's dataType and writable, and no deeper than maxDepth
+  bool         writeBack;                             // an AssetChannel that writes back: a Variable's DataType and AccessLevel read
   int          maxDepth;
 } Walk;
 
@@ -889,20 +1000,36 @@ static bool walkVisited(Walk* wP, const UA_NodeId* idP)
   return false;
 }
 
-static void walkVariable(Walk* wP, const UA_NodeId* idP)
+static void walkVariable(Walk* wP, const UA_NodeId* idP, const UA_DataType* typeP, bool writable)
 {
   if (wP->variables == wP->variablesMax)
   {
-    int        max = (wP->variablesMax == 0) ? 64 : wP->variablesMax * 2;
-    UA_NodeId* v   = (UA_NodeId*) realloc(wP->variableV, max * sizeof(UA_NodeId));
+    int                 max = (wP->variablesMax == 0) ? 64 : wP->variablesMax * 2;
+    UA_NodeId*          v   = (UA_NodeId*) realloc(wP->variableV, max * sizeof(UA_NodeId));
 
     if (v == NULL)
       return;
 
-    wP->variableV    = v;
+    wP->variableV = v;
+
+    const UA_DataType** t = (const UA_DataType**) realloc(wP->typeV, max * sizeof(UA_DataType*));
+
+    if (t == NULL)
+      return;
+
+    wP->typeV = t;
+
+    bool* w = (bool*) realloc(wP->writableV, max * sizeof(bool));
+
+    if (w == NULL)
+      return;
+
+    wP->writableV    = w;
     wP->variablesMax = max;
   }
 
+  wP->typeV[wP->variables]     = typeP;
+  wP->writableV[wP->variables] = writable;
   UA_NodeId_copy(idP, &wP->variableV[wP->variables++]);
 }
 
@@ -916,6 +1043,8 @@ static void walkFree(Walk* wP)
 
   free(wP->visitedV);
   free(wP->variableV);
+  free(wP->typeV);
+  free(wP->writableV);
   free(wP->b.s);
 }
 
@@ -1075,10 +1204,21 @@ static void walkNode(Walk* wP, const UA_NodeId* idP, UA_NodeClass nodeClass, con
     UA_ReadRequest request;
     UA_ReadRequest_init(&request);
     request.nodesToRead        = rv;
-    request.nodesToReadSize    = (wP->inventory == true) ? 3 : 1;
+    request.nodesToReadSize    = ((wP->inventory == true) || (wP->writeBack == true)) ? 3 : 1;
     request.timestampsToReturn = UA_TIMESTAMPSTORETURN_SOURCE;
 
-    UA_ReadResponse response = UA_Client_Service_read(client, request);
+    UA_ReadResponse    response = UA_Client_Service_read(client, request);
+    const UA_DataType* typeP    = NULL;
+    bool               writable = false;
+
+    if ((wP->writeBack == true) && (response.responseHeader.serviceResult == UA_STATUSCODE_GOOD) && (response.resultsSize == 3))
+    {
+      if ((response.results[1].hasValue == true) && (UA_Variant_hasScalarType(&response.results[1].value, &UA_TYPES[UA_TYPES_NODEID]) == true))
+        typeP = UA_findDataType((const UA_NodeId*) response.results[1].value.data);
+
+      if ((response.results[2].hasValue == true) && (UA_Variant_hasScalarType(&response.results[2].value, &UA_TYPES[UA_TYPES_BYTE]) == true))
+        writable = ((*(const UA_Byte*) response.results[2].value.data & UA_ACCESSLEVELMASK_WRITE) != 0);
+    }
 
     if ((wP->inventory == true) && (response.responseHeader.serviceResult == UA_STATUSCODE_GOOD) && (response.resultsSize == 3))
     {
@@ -1129,7 +1269,7 @@ static void walkNode(Walk* wP, const UA_NodeId* idP, UA_NodeClass nodeClass, con
       bufJsonString(bP, code, strlen(code));
     }
 
-    walkVariable(wP, idP);
+    walkVariable(wP, idP, typeP, writable);
   }
   else if (browsed == true)
   {
@@ -1254,7 +1394,8 @@ static bool modelSetup(Endpoint* eP)
   Walk w;
 
   memset(&w, 0, sizeof(w));
-  w.endpoint = eP->name;
+  w.endpoint  = eP->name;
+  w.writeBack = (eP->direction == BridgeDirectionBoth);
 
   walkVisited(&w, &eP->nodeId);
   bufStr(&w.b, "{\"model\":");
@@ -1274,6 +1415,46 @@ static bool modelSetup(Endpoint* eP)
   }
 
   COR_V("opcua: the model under '%s': %d nodes, %d variables", eP->name, w.nodes, w.variables);
+
+  //
+  // Write-back: what a value published on each Variable is converted to - the model as it is now, in place
+  // of the one browsed before (a reconnect browses again). Before the model is handed over: a client may
+  // write as soon as the broker has made the entities
+  //
+  if (w.writeBack == true)
+  {
+    pthread_mutex_lock(&mutex);
+    modelVarsDrop(eP->name);
+
+    for (int ix = 0; ix < w.variables; ix++)
+    {
+      ModelVar* mvP = (ModelVar*) calloc(1, sizeof(ModelVar));
+
+      if (mvP == NULL)
+        break;
+
+      mvP->nodeId   = nodeIdText(&w.variableV[ix]);
+      mvP->endpoint = strdup(eP->name);
+      mvP->dataType = w.typeV[ix];
+      mvP->writable = w.writableV[ix];
+      UA_NodeId_copy(&w.variableV[ix], &mvP->id);
+
+      if ((mvP->nodeId == NULL) || (mvP->endpoint == NULL) || (modelVarFind(mvP->nodeId) != NULL))
+      {
+        free(mvP->nodeId);                            // a Variable of two models: the first one's
+        free(mvP->endpoint);
+        UA_NodeId_clear(&mvP->id);
+        free(mvP);
+        continue;
+      }
+
+      mvP->next = modelVars;
+      modelVars = mvP;
+    }
+
+    pthread_mutex_unlock(&mutex);
+  }
+
   receiveFunc(eP->name, w.b.s, 0);
 
   for (int ix = 0; ix < w.variables; ix++)
@@ -1506,9 +1687,13 @@ static void inventoryDone(InventoryReq* reqP)
 
 
 
+static void callFailed(Op* opP, const char* fmt, ...);   // below, with callRun
+
+
+
 // -----------------------------------------------------------------------------
 //
-// inventoriesRefuse - the queued inventories answered "not connected", on the client's thread while it has no
+// inventoriesRefuse - the queued inventories (and Calls) answered "not connected", on the client's thread while it has no
 // connection: one asked for just before the connection was found lost would else wait out its timeout. The
 // other queued calls stay queued, for the connection that comes back
 //
@@ -1525,7 +1710,7 @@ static void inventoriesRefuse(void)
   {
     Op* opP = *opPP;
 
-    if (opP->type == OpInventory)
+    if ((opP->type == OpInventory) || (opP->type == OpCall))
     {
       *opPP      = opP->next;
       opP->next  = refusedP;
@@ -1545,11 +1730,73 @@ static void inventoriesRefuse(void)
   {
     Op* nextP = refusedP->next;
 
-    notConnected(refusedP->invP->err, sizeof(refusedP->invP->err));
-    inventoryDone(refusedP->invP);
-    opFree(refusedP);
+    if (refusedP->type == OpCall)
+      callFailed(refusedP, "the OPC UA server cannot be reached");   // not run later: whoever asked has been told
+    else
+    {
+      notConnected(refusedP->invP->err, sizeof(refusedP->invP->err));
+      inventoryDone(refusedP->invP);
+      opFree(refusedP);
+    }
+
     refusedP = nextP;
   }
+}
+
+
+
+static void callRun(Op* opP);                         // below, with what converts a call's arguments
+
+
+
+// -----------------------------------------------------------------------------
+//
+// modelVarWrite - a write-back to a Variable of a model, on the client's thread
+//
+static void modelVarWrite(Op* opP)
+{
+  pthread_mutex_lock(&mutex);
+
+  ModelVar* mvP = modelVarFind(opP->endpoint);
+  UA_NodeId id;
+
+  UA_NodeId_init(&id);
+
+  if (mvP != NULL)
+    UA_NodeId_copy(&mvP->id, &id);
+
+  pthread_mutex_unlock(&mutex);
+
+  if (mvP == NULL)
+    return;                                           // the model was browsed again in between, without it
+
+  UA_StatusCode sc = UA_Client_writeValueAttribute(client, id, &opP->value);
+
+  UA_NodeId_clear(&id);
+
+  if (sc != UA_STATUSCODE_GOOD)
+  {
+    COR_W("opcua: writing '%s' failed (%s)", opP->endpoint, UA_StatusCode_name(sc));
+    return;
+  }
+
+  Buf b = { NULL, 0, 0, false };
+
+  variantJson(&b, &opP->value);
+
+  pthread_mutex_lock(&mutex);
+
+  mvP = modelVarFind(opP->endpoint);
+
+  if ((mvP != NULL) && (b.failed == false))
+  {
+    free(mvP->lastWritten);
+    mvP->lastWritten = b.s;
+    b.s              = NULL;
+  }
+
+  pthread_mutex_unlock(&mutex);
+  free(b.s);
 }
 
 
@@ -1570,6 +1817,13 @@ static void opsRun(void)
   {
     Op* nextP = opP->next;
 
+    if (opP->type == OpCall)
+    {
+      callRun(opP);                                   // takes the op over: it is freed when the Call is answered
+      opP = nextP;
+      continue;
+    }
+
     if (opP->type == OpInventory)
     {
       if (connected == true)
@@ -1589,6 +1843,8 @@ static void opsRun(void)
 
     if ((opP->type == OpAdd) && (eP != NULL) && (connected == true) && (eP->ready == false) && (eP->refused == false))
       endpointSetup(eP);
+    else if ((opP->type == OpWrite) && (eP == NULL) && (connected == true))
+      modelVarWrite(opP);
     else if ((opP->type == OpWrite) && (eP != NULL) && (connected == true))
     {
       UA_StatusCode sc = UA_Client_writeValueAttribute(client, eP->nodeId, &opP->value);
@@ -1917,6 +2173,7 @@ void opcuaTransportClose(void)
   }
 
   opsTail = NULL;
+  modelVarsDrop(NULL);
   pthread_mutex_unlock(&mutex);
 
   free(serverUrl);
@@ -1931,8 +2188,6 @@ void opcuaTransportClose(void)
 //
 int opcuaTransportEndpointAdd(const char* endpoint, BridgeDirection direction, const char** whyP)
 {
-  (void) direction;
-
   UA_NodeId nodeId;
 
   if (UA_NodeId_parse(&nodeId, UA_STRING((char*) endpoint)) != UA_STATUSCODE_GOOD)
@@ -1949,8 +2204,9 @@ int opcuaTransportEndpointAdd(const char* endpoint, BridgeDirection direction, c
     return BRIDGE_ERR;
   }
 
-  eP->name   = strdup(endpoint);
-  eP->nodeId = nodeId;
+  eP->name      = strdup(endpoint);
+  eP->nodeId    = nodeId;
+  eP->direction = direction;
 
   pthread_mutex_lock(&mutex);
 
@@ -2063,6 +2319,521 @@ static bool jsonToVariant(const char* json, const UA_DataType* typeP, UA_Variant
 
 // -----------------------------------------------------------------------------
 //
+// callFailed - a Call that did not happen, or failed: told, and the op freed
+//
+static void callFailed(Op* opP, const char* fmt, ...)
+{
+  char    why[512];
+  va_list args;
+
+  va_start(args, fmt);
+  vsnprintf(why, sizeof(why), fmt, args);
+  va_end(args);
+
+  COR_V("opcua: the Call of '%s' for execution '%s' failed: %s", opP->endpoint, opP->executionId, why);
+
+  if ((callFunc != NULL) && (stopping == false))
+    callFunc(opP->executionId, false, NULL, why);
+
+  opFree(opP);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// methodArguments - a method's InputArguments or OutputArguments property, read: its Arguments (the caller
+// clears *vP); false: the property is not there - a method without such arguments
+//
+static bool methodArguments(const UA_NodeId* methodIdP, const char* which, UA_Variant* vP)
+{
+  UA_BrowseResult refs;
+
+  UA_Variant_init(vP);
+
+  if (browseAll(methodIdP, &refs) == false)
+    return false;
+
+  bool found = false;
+
+  for (size_t ix = 0; (ix < refs.referencesSize) && (found == false); ix++)
+  {
+    const UA_ReferenceDescription* rP = &refs.references[ix];
+
+    if ((rP->isForward == false) || (rP->referenceTypeId.namespaceIndex != 0) || (rP->referenceTypeId.identifierType != UA_NODEIDTYPE_NUMERIC) ||
+        (rP->referenceTypeId.identifier.numeric != UA_NS0ID_HASPROPERTY))
+      continue;
+
+    if ((rP->browseName.name.length != strlen(which)) || (memcmp(rP->browseName.name.data, which, rP->browseName.name.length) != 0))
+      continue;
+
+    found = (UA_Client_readValueAttribute(client, rP->nodeId.nodeId, vP) == UA_STATUSCODE_GOOD) &&
+            ((vP->type == &UA_TYPES[UA_TYPES_ARGUMENT]) || (UA_Variant_isEmpty(vP) == true));
+
+    if (found == false)
+      UA_Variant_clear(vP);
+  }
+
+  UA_BrowseResult_clear(&refs);
+  return found;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// scalarText - one JSON value, rendered alone (not its name, not its siblings); false: not a scalar, or too long
+//
+static bool scalarText(CorNode* valueP, char* text, int size)
+{
+  if ((valueP->type == CorArray) || (valueP->type == CorObject))
+    return false;
+
+  CorNode* nextP = valueP->next;
+  char*    name  = valueP->name;
+  bool     fits;
+
+  valueP->next = NULL;
+  valueP->name = NULL;
+
+  fits = (corJsonFastRenderSize(valueP) < size);
+
+  if (fits == true)
+    corJsonFastRender(valueP, text);
+
+  valueP->next = nextP;
+  valueP->name = name;
+
+  return fits;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// argumentValue - one input argument from the JSON the execution input has for it: a scalar, or (valueRank
+// 1 or more) an array of scalars, as the argument's DataType; NULL: ok, else why not
+//
+static const char* argumentValue(CorNode* valueP, const UA_Argument* argP, UA_Variant* vP)
+{
+  static __thread char why[256];
+  const UA_DataType*   typeP = UA_findDataType(&argP->dataType);
+  char                 text[1024];
+
+  if (typeP == NULL)
+    return "a DataType this bridge does not convert to";
+
+  if (argP->valueRank < 1)
+  {
+    if ((scalarText(valueP, text, sizeof(text)) == false) || (jsonToVariant(text, typeP, vP) == false))
+    {
+      snprintf(why, sizeof(why), "not a %s", typeP->typeName);
+      return why;
+    }
+
+    return NULL;
+  }
+
+  if (valueP->type != CorArray)
+  {
+    snprintf(why, sizeof(why), "not an array of %s", typeP->typeName);
+    return why;
+  }
+
+  size_t n = 0;
+
+  for (CorNode* itemP = valueP->value.head; itemP != NULL; itemP = itemP->next)
+    n++;
+
+  void* array = UA_Array_new(n, typeP);
+
+  if ((array == NULL) && (n > 0))
+    return "out of memory";
+
+  size_t ix = 0;
+
+  for (CorNode* itemP = valueP->value.head; itemP != NULL; itemP = itemP->next, ix++)
+  {
+    UA_Variant item;
+
+    UA_Variant_init(&item);
+
+    if ((scalarText(itemP, text, sizeof(text)) == false) || (jsonToVariant(text, typeP, &item) == false))
+    {
+      UA_Array_delete(array, n, typeP);
+      snprintf(why, sizeof(why), "item %zu is not a %s", ix, typeP->typeName);
+      return why;
+    }
+
+    memcpy((char*) array + ix * typeP->memSize, item.data, typeP->memSize);   // the item's members move over
+    UA_free(item.data);
+  }
+
+  UA_Variant_setArray(vP, array, n, typeP);
+  return NULL;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// CallContext - a Call sent, waiting for its answer: what the output is named with
+//
+typedef struct CallContext
+{
+  Op*         opP;
+  UA_Variant  outArgs;                                // the method's OutputArguments (an empty variant: none)
+} CallContext;
+
+
+
+// -----------------------------------------------------------------------------
+//
+// callDone - the server's answer to a Call (on the client's thread, inside UA_Client_run_iterate - or inside
+// UA_Client_disconnect / UA_Client_delete, every Call still waiting answered with its status)
+//
+static void callDone(UA_Client* clientP, void* userdata, UA_UInt32 requestId, UA_CallResponse* crP)
+{
+  (void) clientP;
+  (void) requestId;
+
+  CallContext*  ccP = (CallContext*) userdata;
+  Op*           opP = ccP->opP;
+  UA_StatusCode sc  = crP->responseHeader.serviceResult;
+
+  if ((sc == UA_STATUSCODE_GOOD) && (crP->resultsSize != 1))
+    sc = UA_STATUSCODE_BADUNEXPECTEDERROR;
+
+  if (sc != UA_STATUSCODE_GOOD)
+  {
+    callFailed(opP, "the server answered %s", UA_StatusCode_name(sc));
+    UA_Variant_clear(&ccP->outArgs);
+    free(ccP);
+    return;
+  }
+
+  UA_CallMethodResult* rP = &crP->results[0];
+
+  if (rP->statusCode != UA_STATUSCODE_GOOD)
+  {
+    //
+    // The method's own failure - and which input arguments it did not take, when it says
+    //
+    char   bad[256] = "";
+    size_t len      = 0;
+
+    for (size_t ix = 0; ix < rP->inputArgumentResultsSize; ix++)
+    {
+      if ((rP->inputArgumentResults[ix] != UA_STATUSCODE_GOOD) && (len < sizeof(bad)))
+        len += snprintf(&bad[len], sizeof(bad) - len, "%s argument %zu %s", (len == 0) ? " -" : ",", ix + 1, UA_StatusCode_name(rP->inputArgumentResults[ix]));
+    }
+
+    callFailed(opP, "the method answered %s%s", UA_StatusCode_name(rP->statusCode), bad);
+    UA_Variant_clear(&ccP->outArgs);
+    free(ccP);
+    return;
+  }
+
+  //
+  // The output: an object, each output argument by its name; no output arguments, no output
+  //
+  Buf                b    = { NULL, 0, 0, false };
+  const UA_Argument* argV = (const UA_Argument*) ccP->outArgs.data;
+  size_t             argN = (ccP->outArgs.type == &UA_TYPES[UA_TYPES_ARGUMENT]) ? ccP->outArgs.arrayLength : 0;
+
+  if (rP->outputArgumentsSize > 0)
+  {
+    bufStr(&b, "{");
+
+    for (size_t ix = 0; ix < rP->outputArgumentsSize; ix++)
+    {
+      if (ix > 0)
+        bufStr(&b, ",");
+
+      if ((ix < argN) && (argV[ix].name.length > 0))
+        bufUaString(&b, &argV[ix].name);
+      else
+      {
+        char name[32];
+
+        snprintf(name, sizeof(name), "output%zu", ix + 1);
+        bufJsonString(&b, name, strlen(name));
+      }
+
+      bufStr(&b, ":");
+      variantJson(&b, &rP->outputArguments[ix]);
+    }
+
+    bufStr(&b, "}");
+  }
+
+  if (b.failed == true)
+    callFailed(opP, "out of memory rendering the output");
+  else
+  {
+    COR_V("opcua: the Call of '%s' for execution '%s': %s", opP->endpoint, opP->executionId, (b.s != NULL) ? b.s : "no output");
+
+    if ((callFunc != NULL) && (stopping == false))
+      callFunc(opP->executionId, true, b.s, NULL);
+
+    opFree(opP);
+  }
+
+  free(b.s);
+  UA_Variant_clear(&ccP->outArgs);
+  free(ccP);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// callInput - the execution input as the method's input arguments (inputV, argN of them): an object, a
+// member per argument by its name, and none other; NULL: ok, else why not (in whyBuf)
+//
+static const char* callInput(const char* json, const UA_Argument* argV, size_t argN, UA_Variant* inputV, char* whyBuf, int whyBufLen)
+{
+  CorAlloc    ka;
+  CorJson     cj;
+  char        kaBuf[8 * 1024];
+  CorNode*    inputP = NULL;
+  char*       copy   = (json != NULL) ? strdup(json) : NULL;   // the parse writes into its text
+  const char* why    = NULL;
+
+  corAllocBufferInit(&ka, kaBuf, sizeof(kaBuf), 8 * 1024, NULL, "opcua call");
+  corJsonCreate(&cj, &ka);
+
+  if (copy != NULL)
+    inputP = corJsonParse(&cj, copy);
+
+  if ((json != NULL) && (inputP == NULL))
+    why = "the input is not JSON";
+  else if ((inputP != NULL) && (inputP->type != CorObject) && (inputP->type != CorNull))
+    why = "the input is not an object - a member per input argument";
+
+  for (size_t ix = 0; (ix < argN) && (why == NULL); ix++)
+  {
+    char name[256];
+
+    snprintf(name, sizeof(name), "%.*s", (int) argV[ix].name.length, (char*) argV[ix].name.data);
+
+    CorNode* valueP = ((inputP != NULL) && (inputP->type == CorObject)) ? corTreeLookup(inputP, name) : NULL;
+
+    if (valueP == NULL)
+    {
+      snprintf(whyBuf, whyBufLen, "the input has no '%s' - an input argument of the method", name);
+      why = whyBuf;
+      break;
+    }
+
+    const char* bad = argumentValue(valueP, &argV[ix], &inputV[ix]);
+
+    if (bad != NULL)
+    {
+      snprintf(whyBuf, whyBufLen, "the input argument '%.100s': %.200s", name, bad);
+      why = whyBuf;
+    }
+  }
+
+  //
+  // A member that is no input argument: a mistake the method would not see - refused, not ignored. The
+  // entity's id and type are the broker's, in every input
+  //
+  CorNode* memberP = ((why == NULL) && (inputP != NULL) && (inputP->type == CorObject)) ? inputP->value.head : NULL;
+
+  for (; memberP != NULL; memberP = memberP->next)
+  {
+    bool known = (strcmp(memberP->name, "id") == 0) || (strcmp(memberP->name, "type") == 0);
+
+    for (size_t ix = 0; (ix < argN) && (known == false); ix++)
+      known = (argV[ix].name.length == strlen(memberP->name)) && (memcmp(argV[ix].name.data, memberP->name, argV[ix].name.length) == 0);
+
+    if (known == false)
+    {
+      snprintf(whyBuf, whyBufLen, "'%s' is no input argument of the method", memberP->name);
+      why = whyBuf;
+      break;
+    }
+  }
+
+  corAllocBufferReset(&ka, false);
+  free(copy);                                         // after the tree: its strings point into it
+  return why;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// callRun - a Call, on the client's thread: the method's arguments read, the execution input converted to
+// them, the Call sent - its answer arrives in callDone
+//
+static void callRun(Op* opP)
+{
+  if (connected == false)
+  {
+    callFailed(opP, "the OPC UA server cannot be reached");
+    return;
+  }
+
+  UA_Variant inArgs;
+  UA_Variant outArgs;
+
+  methodArguments(&opP->methodId, "InputArguments",  &inArgs);    // not there: a method without input
+  methodArguments(&opP->methodId, "OutputArguments", &outArgs);
+
+  const UA_Argument* argV   = (const UA_Argument*) inArgs.data;
+  size_t             argN   = (inArgs.type == &UA_TYPES[UA_TYPES_ARGUMENT]) ? inArgs.arrayLength : 0;
+  UA_Variant*        inputV = (argN > 0) ? (UA_Variant*) UA_Array_new(argN, &UA_TYPES[UA_TYPES_VARIANT]) : NULL;
+  char               whyBuf[512];
+  const char*        why    = ((argN > 0) && (inputV == NULL)) ? "out of memory" : callInput(opP->json, argV, argN, inputV, whyBuf, sizeof(whyBuf));
+
+  UA_Variant_clear(&inArgs);
+
+  CallContext* ccP = (why == NULL) ? (CallContext*) calloc(1, sizeof(CallContext)) : NULL;
+
+  if ((why == NULL) && (ccP == NULL))
+    why = "out of memory";
+
+  if (why != NULL)
+  {
+    UA_Array_delete(inputV, argN, &UA_TYPES[UA_TYPES_VARIANT]);
+    UA_Variant_clear(&outArgs);
+    callFailed(opP, "%s", why);
+    return;
+  }
+
+  ccP->opP     = opP;
+  ccP->outArgs = outArgs;                             // moves over
+
+  UA_StatusCode sc = UA_Client_call_async(client, opP->objectId, opP->methodId, argN, inputV, callDone, ccP, NULL);
+
+  UA_Array_delete(inputV, argN, &UA_TYPES[UA_TYPES_VARIANT]);
+
+  if (sc != UA_STATUSCODE_GOOD)
+  {
+    UA_Variant_clear(&ccP->outArgs);
+    free(ccP);
+    callFailed(opP, "the Call could not be sent (%s)", UA_StatusCode_name(sc));
+  }
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// nodeIdDecode - a NodeId of an opcua:// URL, percent-decoded and parsed; false: not one
+//
+static bool nodeIdDecode(const char* from, size_t len, UA_NodeId* idP)
+{
+  char   text[512];
+  size_t n = 0;
+
+  for (size_t ix = 0; ix < len; ix++)
+  {
+    if (n >= sizeof(text) - 1)
+      return false;
+
+    if (from[ix] == '%')
+    {
+      if (ix + 2 >= len)
+        return false;
+
+      char  hex[3] = { from[ix + 1], from[ix + 2], 0 };
+      char* endP;
+      long  c      = strtol(hex, &endP, 16);
+
+      if ((*endP != 0) || (c == 0))
+        return false;
+
+      text[n++] = (char) c;
+      ix += 2;
+    }
+    else
+      text[n++] = from[ix];
+  }
+
+  text[n] = 0;
+
+  return (n > 0) && (UA_NodeId_parse(idP, UA_STRING(text)) == UA_STATUSCODE_GOOD);
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// opcuaTransportCall -
+//
+int opcuaTransportCall(const char* url, const char* executionId, const char* inputJson)
+{
+  static const char prefix[] = "opcua://";
+
+  if ((url == NULL) || (executionId == NULL) || (strncmp(url, prefix, sizeof(prefix) - 1) != 0))
+    return BRIDGE_NOT_FOUND;
+
+  const char* objectText = &url[sizeof(prefix) - 1];
+  const char* slash      = strchr(objectText, '/');
+
+  if ((slash == NULL) || (slash == objectText) || (slash[1] == 0))
+    return BRIDGE_NOT_FOUND;
+
+  UA_NodeId objectId;
+  UA_NodeId methodId;
+
+  if (nodeIdDecode(objectText, slash - objectText, &objectId) == false)
+    return BRIDGE_NOT_FOUND;
+
+  if (nodeIdDecode(&slash[1], strlen(&slash[1]), &methodId) == false)
+  {
+    UA_NodeId_clear(&objectId);
+    return BRIDGE_NOT_FOUND;
+  }
+
+  Op* opP = (Op*) calloc(1, sizeof(Op));
+
+  if (opP == NULL)
+  {
+    UA_NodeId_clear(&objectId);
+    UA_NodeId_clear(&methodId);
+    return BRIDGE_ERR;
+  }
+
+  opP->type        = OpCall;
+  opP->endpoint    = strdup(url);
+  opP->json        = (inputJson != NULL) ? strdup(inputJson) : NULL;
+  opP->executionId = strdup(executionId);
+  opP->objectId    = objectId;
+  opP->methodId    = methodId;
+  UA_Variant_init(&opP->value);
+
+  pthread_mutex_lock(&mutex);
+
+  if (opsTail == NULL)
+    opsHead = opP;
+  else
+    opsTail->next = opP;
+
+  opsTail = opP;
+
+  pthread_mutex_unlock(&mutex);
+  return BRIDGE_OK;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
+// opcuaTransportCallFunc -
+//
+void opcuaTransportCallFunc(OpcuaCallFunc callF)
+{
+  callFunc = callF;
+}
+
+
+
+// -----------------------------------------------------------------------------
+//
 // opcuaTransportSend -
 //
 int opcuaTransportSend(const char* endpoint, const char* json)
@@ -2073,8 +2844,33 @@ int opcuaTransportSend(const char* endpoint, const char* json)
 
   if (eP == NULL)
   {
+    //
+    // A Variable of a model that writes back (an AssetChannel's attribute made from it)
+    //
+    ModelVar* mvP = modelVarFind(endpoint);
+
+    if (mvP == NULL)
+    {
+      pthread_mutex_unlock(&mutex);
+      return BRIDGE_NOT_FOUND;
+    }
+
+    const UA_DataType* typeP    = mvP->dataType;
+    bool               writable = mvP->writable;
+
     pthread_mutex_unlock(&mutex);
-    return BRIDGE_NOT_FOUND;
+
+    if (writable == false)
+      return BRIDGE_UNSUPPORTED;                      // read-only at the server: nothing to send it with
+
+    UA_Variant value;
+    UA_Variant_init(&value);
+
+    if ((typeP == NULL) || (jsonToVariant(json, typeP, &value) == false))
+      return BRIDGE_BAD_INPUT;
+
+    opPush(OpWrite, endpoint, &value, strdup(json));
+    return BRIDGE_OK;
   }
 
   if ((eP->kind == EndpointModel) || (eP->refused == true))

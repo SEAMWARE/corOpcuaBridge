@@ -1,0 +1,240 @@
+#
+# FILE            bridge_opcua_methods.test
+#
+# Copyright 2026 Seamware
+# SPDX-License-Identifier: Apache-2.0
+#
+# OPC UA methods as Service Executions (coraine's doc/service-execution.md, a bridge executor): a Service
+# Registration whose endpoint is opcua://<object NodeId>/<method NodeId> is executed by the bridge - the
+# method called on the object, the execution input its input arguments by name, each converted to the
+# argument's DataType; the output its output arguments by name. The press (an AssetChannel) is the entity:
+#
+#   setSpeed  P17.SetSpeed: in speed (Double), ramp (Boolean); out previous (Double)
+#   log       P17.Log: in lines (String[]); out count (UInt32)
+#   stop      P17.Stop: the method fails (BadInvalidState)
+#   nope      a method the server does not have
+#   bad       opcua://only-an-object - no service of the bridge: 503
+#
+# A failed Call fails the execution: 502, the ProblemDetails saying why - an input that does not fit the
+# arguments is refused before anything is called. With the server down a Call fails at once.
+#
+# REQUIRE_FEATURE: ASSET_CHANNELS
+# REQUIRE_FEATURE: SERVICE_EXECUTION
+#
+--NAME--
+opcua bridge - methods as Service Executions: opcua://<object>/<method>, the input its arguments by name
+
+--TAGS--
+bridge opcua
+
+--INIT--
+rm -rf "${OPCUA_TEST_DIR:?}"
+mkdir -p "$OPCUA_TEST_DIR"
+cat > $OPCUA_TEST_DIR/bridges.json <<J
+{ "opcua": { "server": { "url": "opc.tcp://localhost:$OPCUA_SERVER_PORT", "publishingIntervalMs": 100, "samplingIntervalMs": 50 },
+             "ngsild": { "defaultEntity": false, "assetChannels": {
+               "ns=2;s=Press17": { "entities": "natural" } } } } }
+J
+serverStart
+brokerStart
+
+--RUN--
+B="http://localhost:$OPCUA_PORT/ngsi-ld/v1"
+P=urn:ngsi-ld:PressType:Press17
+
+reg() {  # reg <serviceName> <endpoint> - the HTTP status
+  curl -s -o /dev/null -w "%{http_code}\n" "$B/serviceRegistrations" -H 'Content-Type: application/json' \
+       -d "{\"type\":\"ServiceRegistration\",\"endpoint\":\"$2\",\"entities\":[{\"id\":\"$P\",\"type\":\"PressType\"}],\"serviceInformation\":{\"serviceName\":\"$1\"}}"
+}
+invoke() {  # invoke <serviceName> <input> - the status, then the body: the output, or the error's detail
+  curl -s -w "\n%{http_code}\n" "$B/entities/$P/services/$1" -H 'Content-Type: application/json' -d "$2" > "$OPCUA_TEST_DIR/invoke.out"
+  tail -1 "$OPCUA_TEST_DIR/invoke.out"
+  head -n -1 "$OPCUA_TEST_DIR/invoke.out" | python3 -c '
+import json, sys
+text = sys.stdin.read().strip()
+b = json.loads(text) if text else None
+print(json.dumps(b.get("detail") if isinstance(b, dict) and "detail" in b and "status" in b else b, sort_keys=True))'
+}
+
+entityAwait $P mode '"mode": "auto"'
+
+echo "01. A Service Registration per method - and one whose endpoint names no method"
+echo "==============================================================================="
+reg setSpeed "opcua://ns=2;s=Press17/ns=2;s=P17.SetSpeed"
+reg log      "opcua://ns=2;s=Press17/ns=2;s=P17.Log"
+reg stop     "opcua://ns=2;s=Press17/ns=2;s=P17.Stop"
+reg nope     "opcua://ns=2;s=Press17/ns=2;s=P17.Nope"
+reg bad      "opcua://only-an-object"
+echo
+echo
+
+
+echo "02. setSpeed 12.5, ramp - the method called, its output the previous speed (0)"
+echo "=============================================================================="
+invoke setSpeed '{"speed": 12.5, "ramp": true}'
+deviceAwaitWrite "call ns=2;s=P17.SetSpeed" "12.5 true"
+echo
+echo
+
+
+echo "03. setSpeed 20 - the previous speed 12.5"
+echo "========================================="
+invoke setSpeed '{"speed": 20, "ramp": false}'
+echo
+echo
+
+
+echo "04. log [\"a\", \"b\"] - an array argument: String[]; the output a UInt32"
+echo "======================================================================"
+invoke log '{"lines": ["a", "b"]}'
+deviceAwaitWrite "call ns=2;s=P17.Log" '"a","b"'
+echo
+echo
+
+
+echo "05. Inputs that do not fit the arguments - not a Double, a missing one, one too many, not an array: 502, nothing called"
+echo "======================================================================================================================"
+invoke setSpeed '{"speed": "fast", "ramp": true}'
+invoke setSpeed '{"speed": 1}'
+invoke setSpeed '{"speed": 1, "ramp": true, "force": 9}'
+invoke log '{"lines": "a"}'
+echo
+echo
+
+
+echo "06. stop - the method fails: 502, its StatusCode"
+echo "================================================"
+invoke stop '{}'
+echo
+echo
+
+
+echo "07. nope - no such method on the server: 502"
+echo "============================================"
+invoke nope '{}'
+echo
+echo
+
+
+echo "08. bad - no object and method in the endpoint: the bridge has no such service, 503"
+echo "==================================================================================="
+invoke bad '{}'
+echo
+echo
+
+
+echo "09. POST /services - the same Call as an execution resource: completed, the output kept"
+echo "======================================================================================"
+curl -s -o /dev/null -w "%{http_code}\n" -D "$OPCUA_TEST_DIR/headers" "$B/services" -H 'Content-Type: application/json' \
+     -d "{\"type\":\"ServiceExecution\",\"entityId\":\"$P\",\"serviceName\":\"setSpeed\",\"executionInput\":{\"speed\":30,\"ramp\":true}}"
+id=$(grep -i '^Service-Execution:' "$OPCUA_TEST_DIR/headers" | awk '{print $2}' | tr -d '\r')
+for i in $(seq 1 50); do curl -s "$B/services/$id" | grep -q '"completed"' && break; sleep 0.1; done
+curl -s "$B/services/$id" | python3 -c '
+import json, sys
+e = json.load(sys.stdin)
+print(e["executionStatus"], json.dumps(e.get("executionInput"), sort_keys=True), json.dumps(e.get("executionOutput")))'
+echo
+echo
+
+
+echo "10. The server's calls - only those that reached it"
+echo "==================================================="
+deviceWrites
+echo
+echo
+
+
+echo "11. The server stops - a Call fails at once: 502 (why: not reachable, or the connection closed under it)"
+echo "======================================================================================================="
+serverStop
+sleep 1
+invoke setSpeed '{"speed": 40, "ramp": true}' > "$OPCUA_TEST_DIR/down.out"
+head -1 "$OPCUA_TEST_DIR/down.out"
+echo
+echo
+
+
+--TEARDOWN--
+brokerStop
+serverStop
+rm -f "${OPCUA_TEST_DIR:?}/bridges.json" "$OPCUA_TEST_DIR/server.cmd"
+
+--EXPECT--
+01. A Service Registration per method - and one whose endpoint names no method
+===============================================================================
+201
+201
+201
+201
+201
+
+
+02. setSpeed 12.5, ramp - the method called, its output the previous speed (0)
+==============================================================================
+200
+{"previous": 0}
+call ns=2;s=P17.SetSpeed 12.5 true
+
+
+03. setSpeed 20 - the previous speed 12.5
+=========================================
+200
+{"previous": 12.5}
+
+
+04. log ["a", "b"] - an array argument: String[]; the output a UInt32
+======================================================================
+200
+{"count": 2}
+call ns=2;s=P17.Log "a","b"
+
+
+05. Inputs that do not fit the arguments - not a Double, a missing one, one too many, not an array: 502, nothing called
+======================================================================================================================
+502
+"the input argument 'speed': not a Double"
+502
+"the input has no 'ramp' - an input argument of the method"
+502
+"'force' is no input argument of the method"
+502
+"the input argument 'lines': not an array of String"
+
+
+06. stop - the method fails: 502, its StatusCode
+================================================
+502
+"the method answered BadInvalidState"
+
+
+07. nope - no such method on the server: 502
+============================================
+502
+"the method answered BadMethodInvalid"
+
+
+08. bad - no object and method in the endpoint: the bridge has no such service, 503
+===================================================================================
+503
+"no loaded bridge executes this service"
+
+
+09. POST /services - the same Call as an execution resource: completed, the output kept
+======================================================================================
+201
+completed {"ramp": true, "speed": 30} {"previous": 20}
+
+
+10. The server's calls - only those that reached it
+===================================================
+call ns=2;s=P17.SetSpeed 12.5 true
+call ns=2;s=P17.SetSpeed 20 false
+call ns=2;s=P17.Log "a","b"
+call ns=2;s=P17.SetSpeed 30 true
+
+
+11. The server stops - a Call fails at once: 502 (why: not reachable, or the connection closed under it)
+=======================================================================================================
+502
+
+
