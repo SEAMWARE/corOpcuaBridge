@@ -14,7 +14,8 @@
 #   hydraulicsPressure  "high" does not fit a Double - 400, nothing stored
 #   unit1               a Relationship, made of no one node - 422
 #
-# The server's own changes still come in; the echo of a write is no sample of its own.
+# The server's own changes still come in; the echo of a write is no sample of its own - and a value of
+# another node coming in does not undo a client's write (the broker's kept model has the written value).
 #
 # REQUIRE_FEATURE: ASSET_CHANNELS
 # REQUIRE_FEATURE: CHANNEL_WRITE_BACK
@@ -82,11 +83,12 @@ echo
 echo
 
 
-echo "06. The server's own change still comes in - the pressure 230 at 10:00:05"
-echo "========================================================================="
+echo "06. The server's own change still comes in - the pressure 230 at 10:00:05; the client's mode (02) stays"
+echo "======================================================================================================="
 deviceSet "ns=2;s=P17.Pressure" 230 2026-10-17T10:00:05Z
 entityAwait $P hydraulicsPressure '"hydraulicsPressure": 230'
 entityGet $P hydraulicsPressure
+entityGet $P mode keyValues
 echo
 echo
 
@@ -160,8 +162,8 @@ ns=2;s=P17.Mode "manual"
 }
 
 
-06. The server's own change still comes in - the pressure 230 at 10:00:05
-=========================================================================
+06. The server's own change still comes in - the pressure 230 at 10:00:05; the client's mode (02) stays
+=======================================================================================================
 {
   "hydraulicsPressure": {
     "observedAt": "2026-10-17T10:00:05Z",
@@ -170,6 +172,11 @@ ns=2;s=P17.Mode "manual"
     "value": 230
   },
   "id": "urn:ngsi-ld:PressType:Press17",
+  "type": "PressType"
+}
+{
+  "id": "urn:ngsi-ld:PressType:Press17",
+  "mode": "manual",
   "type": "PressType"
 }
 
